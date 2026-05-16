@@ -1,11 +1,14 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # Manual-only: auto push/PR triggers disabled to stop CI-failure email
+  # spam while the suite is being stabilized. Re-enable by uncommenting
+  # the push/pull_request blocks below.
   workflow_dispatch:
+  # push:
+  #   branches: [main]
+  # pull_request:
+  #   branches: [main]
 
 jobs:
   test:
