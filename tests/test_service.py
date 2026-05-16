@@ -193,6 +193,13 @@ async def test_stop_session_idempotent_for_unknown_channel(
     await svc.stop_session("never-existed")
 
 
+async def test_has_session_record_is_false_for_unknown_channel(
+    store, post, tmp_path, patched_service_env
+) -> None:
+    svc = make_service(store=store, log_root=tmp_path / "logs", post=post)
+    assert not svc.has_session_record("never-existed")
+
+
 async def test_stop_session_marks_state_stopped(
     store, post, tmp_path, fake_proc_factory, patched_service_env
 ) -> None:
@@ -200,10 +207,25 @@ async def test_stop_session_marks_state_stopped(
     project = tmp_path / "p"
     project.mkdir()
     await svc.start_session(channel_id="C1", project_path=str(project))
+    assert svc.has_session_record("C1")
     assert svc.is_active("C1")
     await svc.stop_session("C1")
     sess = store.get("C1")
     assert sess and sess.state == "stopped"
+    assert svc.has_session_record("C1")
+    assert not svc.is_active("C1")
+
+
+async def test_has_session_record_for_stopped_session(
+    store, post, tmp_path, fake_proc_factory, patched_service_env
+) -> None:
+    svc = make_service(store=store, log_root=tmp_path / "logs", post=post)
+    project = tmp_path / "p"
+    project.mkdir()
+    await svc.start_session(channel_id="C1", project_path=str(project))
+    assert svc.has_session_record("C1")
+    await svc.stop_session("C1")
+    assert svc.has_session_record("C1")
     assert not svc.is_active("C1")
 
 

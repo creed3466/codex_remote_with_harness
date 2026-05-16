@@ -1,0 +1,49 @@
+name: Feature request
+description: Suggest a behavior change or new use case for codex_rc
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Keep the request actionable: scope, user workflow, expected behavior.
+  - type: input
+    id: workflow
+    attributes:
+      label: Target workflow
+      description: What are you trying to accomplish?
+      placeholder: "e.g. Start session via thread id and auto-attach to a tmux pane"
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Why now?
+      description: Which pain point does this remove?
+      placeholder: "Current workaround takes X steps and fails in ..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe expected input, output, and user-facing message changes.
+      placeholder: "Input..."
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: |
+        - Command path: ...
+        - Error case handling:
+        - Docs update required:
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: Command surface only
+        - label: Docs and onboarding only
+        - label: Config/behavior change

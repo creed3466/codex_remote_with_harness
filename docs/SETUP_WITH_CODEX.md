@@ -1,7 +1,8 @@
 # Setup With Codex
 
-This is the recommended first-run path. The user only needs a working Codex
-CLI login; Codex can drive the gateway setup and explain the Discord steps.
+This is the easiest first-run path when Codex CLI is already installed and
+logged in. Codex can run the local setup wizard, keep secrets in a local
+`.env`, and start the gateway in the foreground.
 
 ## 1. Sign In To Codex
 
@@ -31,19 +32,18 @@ Set up codex_rc for Discord.
 
 Assume Codex CLI is already installed and logged in.
 Please:
-1. run `codex-rc setup --guided --cwd ~/.codex-rc`
+1. run `codex-rc setup --cwd ~/.codex-rc`
 2. explain each Discord Developer Portal value I need to paste
 3. never print my Discord token after I paste it
 4. create the local `.env`
-5. run `codex-rc gateway doctor --fix --cwd ~/.codex-rc`
-6. print the Discord invite URL
-7. start the gateway with `codex-rc gateway run --cwd ~/.codex-rc`
-8. stop and tell me the exact next command if any step needs manual action
+5. run `codex-rc gateway --cwd ~/.codex-rc doctor`
+6. start the gateway with `codex-rc gateway --cwd ~/.codex-rc run`
+7. stop and tell me the exact next command if any step needs manual action
 ```
 
 ## 3. Discord Values
 
-The guided setup asks for:
+The setup wizard asks for:
 
 | Value | Where to find it |
 | --- | --- |
@@ -52,19 +52,14 @@ The guided setup asks for:
 | Your user ID | Discord Settings -> Advanced -> Developer Mode, then right-click yourself |
 | Guild ID | Optional. Right-click your server. Makes slash commands appear faster. |
 
-After `.env` is written, use:
-
-```bash
-codex-rc gateway invite-url --cwd ~/.codex-rc
-```
-
-Open that URL, select your server, and authorize the bot.
+The local `.env` is written with mode `0600` where the operating system allows
+it. Do not paste tokens into Discord or commit `.env`.
 
 ## 4. Verify
 
 ```bash
-codex-rc gateway doctor --fix --cwd ~/.codex-rc
-codex-rc gateway run --cwd ~/.codex-rc
+codex-rc gateway --cwd ~/.codex-rc doctor
+codex-rc gateway --cwd ~/.codex-rc run
 ```
 
 Then in an allowed Discord channel:

@@ -342,6 +342,28 @@ def test_command_execution_exit_127_is_hidden() -> None:
     assert out == []
 
 
+def test_command_execution_exit_128_is_hidden() -> None:
+    r = NotifRouter()
+    out = r.route(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "t1",
+                "turnId": "u1",
+                "item": {
+                    "id": "e1",
+                    "type": "commandExecution",
+                    "command": "git status",
+                    "exitCode": 128,
+                    "aggregatedOutput": "fatal: not a git repository (or any of the parent directories): .git\n",
+                },
+            },
+        }
+    )
+
+    assert out == []
+
+
 def test_item_completed_flushes_pending_buffer() -> None:
     r = NotifRouter()
     r.route(_make_delta_notif("partial answer."))

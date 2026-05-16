@@ -22,6 +22,7 @@ from codex_rc.service import (
     _load_rules_text,
     _load_rules_text_from,
     _load_soul_text_from,
+    _TurnCompletionWait,
 )
 from codex_rc.session_store import SessionStore
 from codex_rc.workflow_router import (
@@ -31,6 +32,8 @@ from codex_rc.workflow_router import (
     WORKFLOW_DESIGN_MODEL,
     WORKFLOW_SPARK_FALLBACK_MODEL,
     WORKFLOW_SPARK_MODEL,
+    WORKFLOW_VERIFICATION_EFFORT,
+    WORKFLOW_VERIFICATION_MODEL,
     WorkflowExecutionTurn,
 )
 
@@ -531,6 +534,20 @@ async def test_workflow_end_to_end_uses_ephemeral_threads_and_handoff_files(
     ]
     assert len(thread_starts) == 3
     assert len(turn_starts) == 3
+    stage_to_model = {
+        2: WORKFLOW_DESIGN_MODEL,
+        3: WORKFLOW_SPARK_MODEL,
+        4: WORKFLOW_VERIFICATION_MODEL,
+    }
+    stage_to_effort = {
+        2: WORKFLOW_DESIGN_EFFORT,
+        4: WORKFLOW_VERIFICATION_EFFORT,
+    }
+    for turn_params in turn_starts:
+        stage = _extract_stage_from_prompt(turn_params["input"][0]["text"])
+        assert turn_params.get("model") == stage_to_model[stage]
+        if stage in stage_to_effort:
+            assert turn_params.get("effort") == stage_to_effort[stage]
     # The 3 workflow-stage turn/starts target distinct ephemeral threads.
     stage_thread_ids = [
         params["threadId"]
@@ -767,6 +784,334 @@ async def test_workflow_end_to_end_fallback_stage3_on_context_window_exceeded(
         for _, payload in post_calls
     )
     assert any("Workflow complete" in t for t in embed_titles)
+
+
+async def test_pump_skips_discord_posting_for_workflow_ephemeral_notifications(
+    store, fake_proc, post, post_calls
+) -> None:
+    store.register(channel_id="C1", project_path=str(fake_proc.project_path))
+    cs = make_channel_service(
+        store=store,
+        proc=fake_proc,
+        post=post,
+        workflow_enabled=True,
+    )
+
+    loop = asyncio.get_running_loop()
+    workflow_future = loop.create_future()
+    cs._workflow_turn_wait = _TurnCompletionWait(
+        thread_id="eph-workflow",
+        future=workflow_future,
+    )
+
+    cs._pump_task = asyncio.create_task(
+        cs._pump(),
+        name="test-workflow-ephemeral-suppression",
+    )
+
+    await fake_proc.emit(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "eph-workflow",
+                "turnId": "turn-workflow",
+                "item": {
+                    "id": "cmd-1",
+                    "type": "commandExecution",
+                    "command": "git status",
+                    "exitCode": 1,
+                    "aggregatedOutput": (
+                        "fatal: not a git repository (or any of the parent "
+                        "directories): .git\n"
+                    ),
+                },
+            },
+        }
+    )
+    await fake_proc.emit(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "eph-workflow",
+                "turn": {"id": "turn-workflow"},
+            },
+        }
+    )
+    await asyncio.wait_for(workflow_future, timeout=1.0)
+    await asyncio.sleep(0)
+    assert workflow_future.done()
+    assert post_calls == []
+
+    cs._pump_task.cancel()
+    try:
+        await asyncio.wait_for(cs._pump_task, timeout=1.0)
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def test_workflow_end_to_end_retries_schema_repair_for_stage2_handoff(
+    store, fake_proc, post, post_calls, tmp_path
+) -> None:
+    """If stage 2 writes a malformed file-change row, the workflow should
+    retry once with repair instructions and then continue normally on the
+    corrected handoff.
+    """
+    fake_proc.project_path = tmp_path
+    store.register(channel_id="C1", project_path=str(tmp_path))
+    store.update_thread("C1", "thread-main")
+    cs = make_channel_service(
+        store=store,
+        proc=fake_proc,
+        post=post,
+        workflow_enabled=True,
+    )
+
+    await cs.send_text("add retry handling")
+    cs.workflow.observe_notification(
+        {
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "agentMessage",
+                    "text": (
+                        "CODEX_RC_WORKFLOW_OPTIONS:\n"
+                        "A: Approach A\n"
+                        "B: Approach B\n"
+                        "RECOMMENDED: A\n"
+                        "END_CODEX_RC_WORKFLOW_OPTIONS"
+                    ),
+                }
+            },
+        }
+    )
+    button_prompt = cs.workflow.observe_notification(
+        {"method": "turn/completed", "params": {}}
+    )
+    assert button_prompt is not None
+
+    workflow_dir = tmp_path / "data" / "workflow"
+    stage2_invalid = """
+    # Design Brief — {wf}
+
+    ## Task
+    add retry handling
+
+    ## Approved plan
+    A: Approach A
+
+    ## Architecture decisions
+    - Add @retry decorator in src/cron/retry.py
+
+    ## Files to modify / create
+    -
+    - src/cron/worker.py (M): wrap run() with @retry()
+
+    ## Implementation checklist (in order)
+    1. Create src/cron/retry.py with retry() factory
+    2. Wrap worker.run() with @retry()
+
+    ## Test strategy
+    - Unit: decorator under mocked clock
+
+    ## Acceptance criteria
+    - [ ] cron worker retries transient failures
+
+    ## Risks / open questions
+    - None
+
+    ## Output budget for stage 3
+    ≤ 3000 tokens.
+    """
+
+    stage2_valid = """
+    # Design Brief — {wf}
+
+    ## Task
+    add retry handling
+
+    ## Approved plan
+    A: Approach A
+
+    ## Architecture decisions
+    - Add @retry decorator in src/cron/retry.py
+
+    ## Files to modify / create
+    - src/cron/worker.py (M): wrap run() with @retry()
+    - src/cron/retry.py (A): new exponential-backoff decorator
+
+    ## Implementation checklist (in order)
+    1. Create src/cron/retry.py with retry() factory
+    2. Wrap worker.run() with @retry()
+
+    ## Test strategy
+    - Unit: decorator under mocked clock
+
+    ## Acceptance criteria
+    - [ ] cron worker retries transient failures
+
+    ## Risks / open questions
+    - None
+
+    ## Output budget for stage 3
+    ≤ 3000 tokens.
+    """
+
+    stage3_md = """
+    # Verification Brief — {wf}
+
+    ## Task
+    add retry handling
+
+    ## Approved plan
+    A: Approach A
+
+    ## What was implemented
+    Added @retry decorator in src/cron/retry.py and applied to worker.run().
+
+    ## Files changed
+    - src/cron/worker.py (M): wrapped run() with @retry()
+    - src/cron/retry.py (A): new exponential-backoff decorator
+
+    ## Tests added/modified
+    - tests/test_retry.py::test_retries
+
+    ## Out of scope / deferred
+    - None
+
+    ## Verification checklist
+    - [ ] `pytest tests/test_retry.py -v` — green
+    - [ ] Acceptance: worker retries transient failures
+
+    ## Risks / scrutiny areas
+    - None
+
+    ## Output budget for stage 4
+    ≤ 2500 tokens.
+    """
+
+    stage4_md = """
+    # Workflow Result — {wf}
+
+    ## What was asked
+    Add retry handling.
+
+    ## What was done
+    Added exponential-backoff retry decorator and applied it to the worker
+    entry point.
+
+    ## Verification results
+    - ✅ `pytest tests/test_retry.py -v` — 2 passed
+
+    ## Files changed
+    - src/cron/retry.py
+    - src/cron/worker.py
+
+    ## Caveats / follow-ups
+    - None
+    """
+
+    rpc_calls: list[tuple[str, dict]] = []
+    eph_counter = {"n": 0}
+    turn_counter = {"n": 0}
+    stage2_attempts = {"n": 0}
+
+    async def request_side_effect(method, params=None, **_kw):
+        params = dict(params or {})
+        rpc_calls.append((method, params))
+        if method == "turn/start" and "input" in params:
+            text = params["input"][0].get("text", "")
+            if "CODEX_RC_DEVELOPMENT_WORKFLOW" in text:
+                return {"turn": {"id": "turn-stage1"}}
+        if method == "thread/start":
+            eph_counter["n"] += 1
+            return {"thread": {"id": f"eph-{eph_counter['n']}"}}
+        if method == "turn/start":
+            turn_counter["n"] += 1
+            turn_id = f"turn-{turn_counter['n']}"
+            thread_id = params.get("threadId", "")
+            stage = _extract_stage_from_prompt(params["input"][0]["text"])
+            workflow_id = _extract_workflow_id_from_prompt(
+                params["input"][0]["text"]
+            )
+
+            if stage == 2:
+                stage2_attempts["n"] += 1
+                content = stage2_invalid if stage2_attempts["n"] == 1 else stage2_valid
+            elif stage == 3:
+                content = stage3_md
+            elif stage == 4:
+                content = stage4_md
+            else:
+                content = ""
+
+            async def complete() -> None:
+                await asyncio.sleep(0)
+                handoff_path = (
+                    workflow_dir / workflow_id / f"stage_{stage}_handoff.md"
+                )
+                handoff_path.parent.mkdir(parents=True, exist_ok=True)
+                handoff_path.write_text(
+                    content.format(wf=workflow_id), encoding="utf-8"
+                )
+                cs._observe_workflow_turn_completion(
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": thread_id,
+                            "turn": {"id": turn_id},
+                        },
+                    }
+                )
+
+            asyncio.create_task(complete())
+            return {"turn": {"id": turn_id}}
+
+        if method == "thread/inject_items":
+            return {}
+        return {}
+
+    fake_proc.request.side_effect = request_side_effect
+
+    assert await cs.handle_button(button_prompt.buttons[0].custom_id) is True
+    assert cs._workflow_execution_task is not None
+    await asyncio.wait_for(cs._workflow_execution_task, timeout=5.0)
+
+    assert stage2_attempts["n"] == 2
+
+    archive_root = workflow_dir / "_archive"
+    assert archive_root.exists()
+    archived = list(archive_root.iterdir())
+    assert len(archived) == 1
+    meta_raw = (archived[0] / "meta.json").read_text(encoding="utf-8")
+    assert '"outcome": "completed"' in meta_raw
+
+    thread_starts = [m for m, _ in rpc_calls if m == "thread/start"]
+    turn_starts = [params for m, params in rpc_calls if m == "turn/start"]
+    assert len(thread_starts) == 4
+    assert len(turn_starts) == 4
+
+    stage2_turns = [
+        _extract_stage_from_prompt(p["input"][0]["text"]) for p in turn_starts
+    ]
+    assert stage2_turns.count(2) == 2
+    for turn_params in turn_starts:
+        stage = _extract_stage_from_prompt(turn_params["input"][0]["text"])
+        if stage == 2:
+            assert turn_params["model"] == WORKFLOW_DESIGN_MODEL
+            assert turn_params["effort"] == WORKFLOW_DESIGN_EFFORT
+        elif stage == 3:
+            assert turn_params["model"] == WORKFLOW_SPARK_MODEL
+        elif stage == 4:
+            assert turn_params["model"] == WORKFLOW_VERIFICATION_MODEL
+            assert turn_params["effort"] == WORKFLOW_VERIFICATION_EFFORT
+
+    titles = [
+        embed.get("title", "")
+        for _, payload in post_calls
+        for embed in payload.get("embeds", [])
+    ]
+    assert any("Workflow handoff schema repair" in t for t in titles)
+    assert any("Workflow complete" in t for t in titles)
 
     inject_calls = [
         params for m, params in rpc_calls if m == "thread/inject_items"
@@ -1067,11 +1412,11 @@ async def test_plan_progress_updates_one_editable_message(
     assert channel_id == "C1"
     assert key == "plan:t1:u1"
     content = payload["content"]
-    assert content.startswith("```ansi")
+    assert content.startswith("```")
     assert "✅ Open file" in content
-    assert "▶ " in content
     assert "⬜ Run tests" in content
-    assert "\x1b[" in content
+    assert any("⠋" in line for line in content.splitlines())
+    assert "⬜ Run tests" in content
 
     await cs._handle_plan_progress(  # noqa: SLF001
         {
@@ -1083,7 +1428,7 @@ async def test_plan_progress_updates_one_editable_message(
     assert len(post_update_calls) == 2
     assert post_update_calls[-1][1] == "plan:t1:u1"
     assert "✅ Edit lines" in post_update_calls[-1][2]["content"]
-    assert cs._plan_snapshot is None  # noqa: SLF001
+    assert cs._plan_progress.snapshot is None  # noqa: SLF001
 
 
 async def test_plan_progress_animates_immediately(
@@ -1116,7 +1461,7 @@ async def test_plan_progress_animates_immediately(
     first_content = post_update_calls[0][2]["content"]
     second_content = post_update_calls[1][2]["content"]
     assert first_content != second_content
-    assert "\x1b[" in second_content
+    assert "..." not in second_content
 
     await cs._handle_plan_progress(  # noqa: SLF001
         {
@@ -1124,7 +1469,7 @@ async def test_plan_progress_animates_immediately(
             "params": {"threadId": "t1", "turn": {"id": "u1"}},
         }
     )
-    assert cs._plan_snapshot is None  # noqa: SLF001
+    assert cs._plan_progress.snapshot is None  # noqa: SLF001
 
 
 # ====================================================================== resume / new
@@ -1721,3 +2066,202 @@ async def test_on_codex_crash_without_prior_thread_starts_fresh(
             await cs._pump_task
         except (asyncio.CancelledError, Exception):
             pass
+
+
+# ============================================================== workflow guards
+#
+# These cover the two bugs surfaced by the 2026-05-15 17:49 log:
+#
+#   1. ``turn/started`` on a workflow ephemeral thread used to clobber
+#      ``_active_turn_id`` on the main channel session. The next user
+#      message took the ``turn/steer`` branch in ``send_text`` and codex
+#      rejected with ``no active turn to steer`` because the main thread
+#      had no live turn — the steer was implicitly targeting the wrong
+#      thread.
+#
+#   2. ``send_text`` had no awareness of workflow execution being
+#      in-flight, so the raw RpcError above propagated to the Discord
+#      bot's exception handler with no user-visible feedback.
+#
+
+async def test_update_turn_state_ignores_workflow_ephemeral_turn_started(
+    store, fake_proc, post,
+) -> None:
+    """``_active_turn_id`` is the main-thread's turn id (drives steer and
+    ✋-interrupt). A ``turn/started`` on the workflow ephemeral thread
+    must not poison it — otherwise the next user message issues
+    ``turn/steer`` with a turnId codex can't match to the main thread.
+    """
+    store.register(channel_id="C1", project_path=str(fake_proc.project_path))
+    cs = make_channel_service(store=store, proc=fake_proc, post=post)
+
+    cs._workflow_turn_wait = _TurnCompletionWait(
+        thread_id="ephemeral-stage-3", future=asyncio.get_running_loop().create_future()
+    )
+    try:
+        await cs._update_turn_state({
+            "method": "turn/started",
+            "params": {
+                "threadId": "ephemeral-stage-3",
+                "turn": {"id": "ephemeral-turn"},
+            },
+        })
+
+        assert cs._active_turn_id is None
+    finally:
+        cs._workflow_turn_wait = None
+
+
+async def test_update_turn_state_still_tracks_main_thread_turn(
+    store, fake_proc, post,
+) -> None:
+    """Mirror of the guard above: a ``turn/started`` on a thread that
+    isn't the workflow ephemeral must still set ``_active_turn_id`` so
+    steer / interrupt continue to work for the main channel session."""
+    store.register(channel_id="C1", project_path=str(fake_proc.project_path))
+    cs = make_channel_service(store=store, proc=fake_proc, post=post)
+
+    cs._workflow_turn_wait = _TurnCompletionWait(
+        thread_id="ephemeral-stage-3", future=asyncio.get_running_loop().create_future()
+    )
+    try:
+        await cs._update_turn_state({
+            "method": "turn/started",
+            "params": {
+                "threadId": "main-thread",
+                "turn": {"id": "main-turn"},
+            },
+        })
+
+        assert cs._active_turn_id == "main-turn"
+    finally:
+        cs._workflow_turn_wait = None
+
+
+async def test_send_text_rejects_while_workflow_executing(
+    store, fake_proc, post, post_calls,
+) -> None:
+    """During workflow execution the user's main channel must be locked:
+    send_text posts a Discord warning and does NOT issue ``turn/start``
+    or ``turn/steer`` on the main thread."""
+    store.register(channel_id="C1", project_path=str(fake_proc.project_path))
+    store.update_thread("C1", "thread-main")
+    cs = make_channel_service(store=store, proc=fake_proc, post=post)
+
+    # Mimic a workflow stage being in-flight: the execution task is
+    # alive and a stage is waiting on its ephemeral thread.
+    cs._workflow_turn_wait = _TurnCompletionWait(
+        thread_id="ephemeral-stage-3", future=asyncio.get_running_loop().create_future()
+    )
+
+    async def _never_completes() -> None:
+        await asyncio.sleep(3600)
+
+    cs._workflow_execution_task = asyncio.create_task(_never_completes())
+    try:
+        await cs.send_text("hello mid workflow")
+
+        # No turn/start or turn/steer hit the main thread.
+        methods = [c.args[0] for c in fake_proc.request.call_args_list]
+        assert "turn/start" not in methods
+        assert "turn/steer" not in methods
+
+        # User got a clear Discord warning.
+        titles: list[str] = []
+        for _channel, payload in post_calls:
+            for embed in payload.get("embeds") or []:
+                titles.append(str(embed.get("title", "")))
+        assert any("Workflow in progress" in t for t in titles), titles
+    finally:
+        cs._workflow_execution_task.cancel()
+        with pytest.raises((asyncio.CancelledError, Exception)):
+            await cs._workflow_execution_task
+        cs._workflow_execution_task = None
+        cs._workflow_turn_wait = None
+
+
+async def test_workflow_stage_falls_back_on_timeout(
+    monkeypatch, store, fake_proc, post, post_calls,
+) -> None:
+    """If a stage runs past WORKFLOW_STAGE_COMPLETION_TIMEOUT_SECONDS
+    (degenerate Spark output loop with no turn/completed), the stage
+    must (a) issue turn/interrupt on the stuck ephemeral, (b) retry on
+    the fallback model with a fresh ephemeral thread, and (c) post a
+    ``Workflow model fallback`` warning citing the timeout.
+    """
+    monkeypatch.setattr(
+        "codex_rc.service.WORKFLOW_STAGE_COMPLETION_TIMEOUT_SECONDS",
+        0.05,
+    )
+
+    store.register(channel_id="C1", project_path=str(fake_proc.project_path))
+    store.update_thread("C1", "thread-1")
+    cs = make_channel_service(
+        store=store,
+        proc=fake_proc,
+        post=post,
+        workflow_enabled=True,
+    )
+
+    def completion(params, _calls):
+        # Spark turn never completes → timeout. Fallback completes.
+        if params.get("model") == WORKFLOW_SPARK_MODEL:
+            return "no-completion"
+        return None
+
+    calls: list[tuple[str, dict]] = []
+    ephemeral_counter = {"n": 0}
+    turn_counter = {"n": 0}
+
+    async def request_side_effect(method, params=None, **_kw):
+        params = dict(params or {})
+        calls.append((method, params))
+        if method == "thread/start":
+            ephemeral_counter["n"] += 1
+            return {"thread": {"id": f"eph-{ephemeral_counter['n']}"}}
+        if method == "turn/start":
+            turn_counter["n"] += 1
+            turn_id = f"turn-{turn_counter['n']}"
+            thread_id = params.get("threadId", "")
+            outcome = completion(params, calls)
+
+            async def deliver() -> None:
+                if outcome == "no-completion":
+                    return  # never complete → timeout in waiter
+                await asyncio.sleep(0)
+                cs._observe_workflow_turn_completion({
+                    "method": "turn/completed",
+                    "params": {"threadId": thread_id, "turn": {"id": turn_id}},
+                })
+
+            asyncio.create_task(deliver())
+            return {"turn": {"id": turn_id}}
+        if method == "turn/interrupt":
+            return {}
+        return {}
+
+    fake_proc.request.side_effect = request_side_effect
+
+    turn = WorkflowExecutionTurn(
+        stage=3,
+        title="Implementation",
+        prompt="implement",
+        model=WORKFLOW_SPARK_MODEL,
+        fallback_model=WORKFLOW_SPARK_FALLBACK_MODEL,
+    )
+
+    await cs._run_workflow_stage_turn(turn)
+
+    methods = [m for m, _ in calls]
+    # spark thread + spark turn → timeout interrupt → fresh thread + fallback turn
+    assert methods.count("thread/start") == 2
+    assert methods.count("turn/start") == 2
+    assert "turn/interrupt" in methods
+    turn_models = [p.get("model") for m, p in calls if m == "turn/start"]
+    assert turn_models == [WORKFLOW_SPARK_MODEL, WORKFLOW_SPARK_FALLBACK_MODEL]
+
+    fallback_payloads = [
+        payload for _, payload in post_calls if "Workflow model fallback" in str(payload)
+    ]
+    assert fallback_payloads
+    assert "timeout" in str(fallback_payloads[-1]).lower()

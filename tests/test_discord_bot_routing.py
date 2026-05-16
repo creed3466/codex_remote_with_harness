@@ -8,6 +8,7 @@ with cheap MagicMock messages.
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -15,7 +16,13 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from codex_rc.discord_bot import AccessControl, CodexRcBot, _parse_start_options
+from codex_rc.discord_bot import (
+    GATEWAY_RESTART_BUTTON_PREFIX,
+    AccessControl,
+    CodexRcBot,
+    _parse_start_options,
+    _RestartGatewayButton,
+)
 from codex_rc.session_store import HandoffRecord, Session, ThreadRecord
 
 # ============================================================ fixtures
@@ -23,6 +30,7 @@ from codex_rc.session_store import HandoffRecord, Session, ThreadRecord
 def make_service() -> MagicMock:
     svc = MagicMock()
     svc.is_active = MagicMock(return_value=True)
+    svc.has_session_record = MagicMock(return_value=True)
     svc.start_session = AsyncMock()
     svc.stop_session = AsyncMock()
     svc.send_text = AsyncMock()
@@ -60,6 +68,7 @@ def make_bot(
     bot._last_user_message = {}
     bot._editable_messages = {}
     bot._warned_blocked_users = set()
+    bot._autocomplete_path_tokens = {}
     return bot
 
 
@@ -82,6 +91,52 @@ def make_message(
     msg.reply = AsyncMock()
     msg.add_reaction = AsyncMock()
     return msg
+
+
+class _FakeCodexCommandTree:
+    def __init__(self) -> None:
+        self.codex_cmd = None
+
+    class _FakeCommand:
+        def __init__(self, callback) -> None:
+            self.callback = callback
+
+        def autocomplete(self, *args, **kwargs):  # type: ignore[override]
+            def _decorate(func):
+                return self
+
+            return _decorate
+
+    def command(self, *args, **kwargs):  # type: ignore[override]
+        def _decorate(func):
+            self.codex_cmd = self._FakeCommand(func)
+            return self.codex_cmd
+
+        return _decorate
+
+
+def make_slash_interaction(
+    *,
+    user_id: int = 42,
+    channel_id: int = 100,
+) -> MagicMock:
+    inter = MagicMock(spec=discord.Interaction)
+    inter.channel_id = channel_id
+    inter.user = MagicMock(id=user_id)
+    inter.response = MagicMock()
+    inter.response.send_message = AsyncMock()
+    inter.response.defer = AsyncMock()
+    inter.followup = MagicMock()
+    inter.followup.send = AsyncMock()
+    return inter
+
+
+def register_codex_command(bot: CodexRcBot) -> Any:
+    tree = _FakeCodexCommandTree()
+    bot.tree = tree
+    bot._register_commands()
+    assert tree.codex_cmd is not None
+    return tree.codex_cmd.callback
 
 
 def make_attachment(*, url: str, content_type: str = "image/png") -> MagicMock:
@@ -302,6 +357,40 @@ async def test_text_codex_start_invokes_service_and_replies() -> None:
     assert "Project: `/p`" in msg.reply.call_args.args[0]
 
 
+async def test_text_codex_start_with_autocomplete_token() -> None:
+    bot = make_bot()
+    bot.service.start_session = AsyncMock(return_value=make_session("t-1"))
+    token = "codexrc-path:abcdef1234"
+    bot._autocomplete_path_tokens[token] = (
+        "100",
+        "42",
+        "/tmp/long/path",
+        time.time() + 60,
+    )
+    msg = make_message(content="/codex start codexrc-path:abcdef1234")
+    await bot._handle_text_codex_command(msg, "start codexrc-path:abcdef1234")
+    bot.service.start_session.assert_awaited_once_with(
+        channel_id="100",
+        project_path="/tmp/long/path",
+    )
+    assert "Project: `/p`" in msg.reply.call_args.args[0]
+
+
+async def test_text_codex_start_with_expired_autocomplete_token_errors() -> None:
+    bot = make_bot()
+    token = "codexrc-path:deadbeef1234"
+    bot._autocomplete_path_tokens[token] = (
+        "100",
+        "42",
+        "/tmp/long/path",
+        time.time() - 1,
+    )
+    msg = make_message(content="/codex start codexrc-path:deadbeef1234")
+    await bot._handle_text_codex_command(msg, "start codexrc-path:deadbeef1234")
+    assert "reselect" in msg.reply.call_args.args[0]
+    bot.service.start_session.assert_not_called()
+
+
 def test_parse_start_options_extracts_permissions_flag() -> None:
     path, preset = _parse_start_options(
         "start /tmp/proj --permissions read-only",
@@ -497,6 +586,97 @@ async def test_text_codex_stop() -> None:
     assert "Session stopped" in msg.reply.call_args.args[0]
 
 
+async def test_text_codex_stop_without_session() -> None:
+    bot = make_bot()
+    bot.service.has_session_record = MagicMock(return_value=False)
+    msg = make_message(content="/codex stop")
+    await bot._handle_text_codex_command(msg, "stop")
+    msg.reply.assert_called_once()
+    assert "No session in this channel." in msg.reply.call_args.args[0]
+    bot.service.stop_session.assert_not_called()
+
+
+async def test_text_codex_restart_sends_confirmation_button() -> None:
+    bot = make_bot()
+    msg = make_message(content="/codex restart")
+    await bot._handle_text_codex_command(msg, "restart")
+    msg.reply.assert_called_once()
+    assert "Confirm gateway restart" in msg.reply.call_args.args[0]
+    view = msg.reply.call_args.kwargs["view"]
+    assert len(view.children) == 1
+    assert view.children[0].custom_id.startswith(GATEWAY_RESTART_BUTTON_PREFIX)
+
+
+async def test_text_codex_exit_without_session() -> None:
+    bot = make_bot()
+    bot.service.has_session_record = MagicMock(return_value=False)
+    msg = make_message(content="/exit")
+    await bot._handle_text_codex_command(msg, "exit")
+    msg.reply.assert_called_once()
+    assert "No session in this channel." in msg.reply.call_args.args[0]
+    bot.service.stop_session.assert_not_called()
+
+
+async def test_slash_codex_stop_without_session() -> None:
+    bot = make_bot()
+    bot.service.has_session_record = MagicMock(return_value=False)
+    cmd = register_codex_command(bot)
+    inter = make_slash_interaction()
+    await cmd(
+        inter,
+        action=discord.app_commands.Choice(name="Stop", value="stop"),
+        project_path=None,
+        permissions=None,
+    )
+    inter.response.send_message.assert_awaited_once_with(
+        "No session in this channel.", ephemeral=True
+    )
+    bot.service.stop_session.assert_not_called()
+
+
+async def test_slash_codex_restart_shows_confirmation() -> None:
+    bot = make_bot()
+    cmd = register_codex_command(bot)
+    inter = make_slash_interaction()
+    await cmd(
+        inter,
+        action=discord.app_commands.Choice(name="Restart gateway", value="restart"),
+        project_path=None,
+        permissions=None,
+    )
+    inter.response.send_message.assert_awaited_once()
+    args = inter.response.send_message.await_args.args
+    assert "Confirm gateway restart" in args[0]
+    view = inter.response.send_message.await_args.kwargs["view"]
+    assert len(view.children) == 1
+    assert view.children[0].custom_id.startswith(GATEWAY_RESTART_BUTTON_PREFIX)
+
+
+async def test_slash_codex_start_with_autocomplete_token() -> None:
+    bot = make_bot()
+    bot.service.start_session = AsyncMock(return_value=make_session("thread-start"))
+    token = "codexrc-path:abcdef1234"
+    bot._autocomplete_path_tokens[token] = (
+        "100",
+        "42",
+        "/tmp/very/long/path",
+        time.time() + 60,
+    )
+    cmd = register_codex_command(bot)
+    inter = make_slash_interaction()
+    await cmd(
+        inter,
+        action=discord.app_commands.Choice(name="Start", value="start"),
+        project_path=token,
+        permissions=None,
+    )
+    bot.service.start_session.assert_awaited_once_with(
+        channel_id="100",
+        project_path="/tmp/very/long/path",
+    )
+    assert bot._autocomplete_path_tokens[token][2] == "/tmp/very/long/path"
+
+
 # ============================================================ on_interaction
 
 def make_button_interaction(
@@ -512,6 +692,9 @@ def make_button_interaction(
     inter.channel_id = channel_id
     inter.response = MagicMock()
     inter.response.send_message = AsyncMock()
+    inter.response.defer = AsyncMock()
+    inter.followup = MagicMock()
+    inter.followup.send = AsyncMock()
     return inter
 
 
@@ -554,6 +737,62 @@ async def test_on_interaction_expired_button() -> None:
     inter = make_button_interaction(custom_id="codex_rc:abc:accept")
     await bot.on_interaction(inter)
     assert "expired" in inter.response.send_message.await_args.args[0]
+
+
+async def test_restart_button_requires_allowlist() -> None:
+    bot = make_bot(allowed={"42"})
+    btn = _RestartGatewayButton(bot=bot, channel_id="100")
+    inter = make_button_interaction(custom_id=btn.custom_id, user_id=999)
+    await btn.callback(inter)
+    assert "Not allowed" in inter.response.send_message.await_args.args[0]
+
+
+async def test_restart_button_checks_channel_match() -> None:
+    bot = make_bot()
+    btn = _RestartGatewayButton(bot=bot, channel_id="100")
+    inter = make_button_interaction(custom_id=btn.custom_id, channel_id=200)
+    await btn.callback(inter)
+    assert "Channel mismatch" in inter.response.send_message.await_args.args[0]
+
+
+async def test_restart_button_requests_restart_and_schedules_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = make_bot()
+    btn = _RestartGatewayButton(bot=bot, channel_id="100")
+    inter = make_button_interaction(custom_id=btn.custom_id)
+
+    request = MagicMock()
+    monkeypatch.setattr("codex_rc.discord_bot.request_self_restart", request)
+    shutdown = AsyncMock()
+    monkeypatch.setattr("codex_rc.discord_bot._shutdown_after_restart_ack", shutdown)
+
+    await btn.callback(inter)
+
+    request.assert_called_once_with(delay_seconds=1.0)
+    shutdown.assert_called_once_with(bot)
+    inter.response.defer.assert_awaited_once()
+    inter.followup.send.assert_awaited_once_with(
+        "♻️ Gateway restart requested. Restarting gateway process."
+    )
+
+
+async def test_restart_button_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = make_bot()
+    btn = _RestartGatewayButton(bot=bot, channel_id="100")
+    inter = make_button_interaction(custom_id=btn.custom_id)
+
+    def _raise() -> None:
+        raise RuntimeError("no manager")
+
+    shutdown = AsyncMock()
+    monkeypatch.setattr("codex_rc.discord_bot.request_self_restart", _raise)
+    monkeypatch.setattr("codex_rc.discord_bot._shutdown_after_restart_ack", shutdown)
+
+    await btn.callback(inter)
+
+    assert "gateway restart failed" in inter.followup.send.await_args.args[0]
+    shutdown.assert_not_called()
 
 
 # ============================================================ post()

@@ -6,7 +6,7 @@ opinionated — please read this short guide before opening a PR.
 ## Dev setup
 
 ```bash
-git clone git@github.com:your-org/codex_remote_control.git codex_rc
+git clone git@github.com:creed3466/codex_remote_with_harness.git codex_rc
 cd codex_rc
 uv venv --python 3.12 .venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
@@ -70,7 +70,7 @@ re-run the script and commit the diff.
 
 ## Reporting issues
 
-- Open issues at <https://github.com/your-org/codex_remote_control/issues>.
+- Open issues at <https://github.com/creed3466/codex_remote_with_harness/issues>.
 - Please include: codex CLI version, Python version, OS, and a relevant
   excerpt of `$CODEX_RC_LOG_PATH` (default `/tmp/codex_rc.log`).
 

@@ -23,8 +23,6 @@ import textwrap
 from dataclasses import dataclass
 from typing import Any
 
-from .workflow_store import workflow_handoff_relpath
-
 from .approval_router import (
     STYLE_DANGER,
     STYLE_SECONDARY,
@@ -32,6 +30,7 @@ from .approval_router import (
 )
 from .notif_router import DiscordEmbed
 from .rpc_client import JsonObj
+from .workflow_store import workflow_handoff_relpath
 
 WORKFLOW_CUSTOM_ID_PREFIX = "codex_rc:wf"
 WORKFLOW_ID_BYTES = 4
@@ -43,9 +42,11 @@ TOKEN_CANCEL = "cancel"
 WORKFLOW_ANALYSIS_MODEL = "gpt-5.5"
 WORKFLOW_ANALYSIS_EFFORT = "high"
 WORKFLOW_DESIGN_MODEL = "gpt-5.5"
-WORKFLOW_DESIGN_EFFORT = "medium"
+WORKFLOW_DESIGN_EFFORT = "high"
 WORKFLOW_SPARK_MODEL = "gpt-5.3-codex-spark"
 WORKFLOW_SPARK_FALLBACK_MODEL = "gpt-5.4"
+WORKFLOW_VERIFICATION_MODEL = "gpt-5.4"
+WORKFLOW_VERIFICATION_EFFORT = "medium"
 
 #: Output token budgets each stage's handoff must respect so the next
 #: stage's model has room for its own input + work. Stage 3/4 run on
@@ -606,8 +607,8 @@ def build_execution_turns(
                 selected_title=selected_title,
                 has_images=has_images,
             ),
-            model=WORKFLOW_SPARK_MODEL,
-            fallback_model=WORKFLOW_SPARK_FALLBACK_MODEL,
+            model=WORKFLOW_VERIFICATION_MODEL,
+            effort=WORKFLOW_VERIFICATION_EFFORT,
             workflow_id=workflow_id,
             prior_handoff_relpath=workflow_handoff_relpath(workflow_id, stage=3),
             next_handoff_relpath=workflow_handoff_relpath(workflow_id, stage=4),
@@ -662,7 +663,7 @@ def _build_design_prompt(
           - ...
           ## Files to modify / create
           - <path> (A|M|D): <one-line summary>
-          - ...
+          (repeat concrete rows only; no placeholder or empty bullets)
           ## Implementation checklist (in order)
           1. <step 1>
           2. <step 2>
@@ -733,7 +734,7 @@ def _build_implementation_prompt(
           <3-5 lines>
           ## Files changed
           - <path> (A|M|D): <one-line summary>
-          - ...
+          (repeat concrete rows only; no placeholder or empty bullets)
           ## Tests added/modified
           - <test path::test_name>   (or "- none")
           ## Out of scope / deferred
@@ -746,7 +747,7 @@ def _build_implementation_prompt(
           ## Output budget for stage 4
           ≤ {WORKFLOW_STAGE_3_TO_4_BUDGET_TOKENS} tokens.
 
-        Stage 4 (Verification) runs on {WORKFLOW_SPARK_MODEL} (128K
+        Stage 4 (Verification) runs on {WORKFLOW_VERIFICATION_MODEL} (128K
         effective context). Keep the handoff under
         {WORKFLOW_STAGE_3_TO_4_BUDGET_TOKENS} tokens.
 
@@ -845,6 +846,8 @@ __all__ = [
     "WORKFLOW_FINAL_SUMMARY_BUDGET_TOKENS",
     "WORKFLOW_SPARK_FALLBACK_MODEL",
     "WORKFLOW_SPARK_MODEL",
+    "WORKFLOW_VERIFICATION_EFFORT",
+    "WORKFLOW_VERIFICATION_MODEL",
     "WORKFLOW_STAGE_1_TO_2_BUDGET_TOKENS",
     "WORKFLOW_STAGE_2_TO_3_BUDGET_TOKENS",
     "WORKFLOW_STAGE_3_TO_4_BUDGET_TOKENS",

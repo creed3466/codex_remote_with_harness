@@ -55,9 +55,9 @@ codex-rc-discord = "codex_rc:cli_discord"
 codex-rc-gateway = "codex_rc.gateway:main"
 
 [project.urls]
-Homepage = "https://github.com/your-org/codex_remote_control"
-Repository = "https://github.com/your-org/codex_remote_control"
-Issues = "https://github.com/your-org/codex_remote_control/issues"
+Homepage = "https://github.com/creed3466/codex_remote_with_harness"
+Repository = "https://github.com/creed3466/codex_remote_with_harness"
+Issues = "https://github.com/creed3466/codex_remote_with_harness/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/codex_rc"]

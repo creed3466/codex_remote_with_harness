@@ -6,9 +6,9 @@ from codex_rc.discord_bot import _parse_text_codex_args
 
 
 def test_positional_start() -> None:
-    assert _parse_text_codex_args("start /Users/alice/work/claude") == (
+    assert _parse_text_codex_args("start /Users/alice/Project/claude") == (
         "start",
-        "/Users/alice/work/claude",
+        "/Users/alice/Project/claude",
     )
 
 
@@ -22,8 +22,8 @@ def test_positional_status() -> None:
 
 def test_slash_menu_shape() -> None:
     assert _parse_text_codex_args(
-        "action:start project_path:/Users/alice/work/claude"
-    ) == ("start", "/Users/alice/work/claude")
+        "action:start project_path:/Users/alice/Project/claude"
+    ) == ("start", "/Users/alice/Project/claude")
 
 
 def test_slash_menu_reversed_order() -> None:

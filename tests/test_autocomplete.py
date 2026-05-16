@@ -28,6 +28,7 @@ def _make_bot(history_paths: list[str] | None = None) -> CodexRcBot:
     bot._connection.user = MagicMock(id=999_999)
     bot._last_user_message = {}
     bot._warned_blocked_users = set()
+    bot._autocomplete_path_tokens = {}
     # store.list_all returns Session-like objects with .project_path only
     sessions = [MagicMock(project_path=p) for p in (history_paths or [])]
     bot.service.store = MagicMock()
@@ -40,6 +41,11 @@ def _make_interaction(channel_id: int = 100, user_id: int = 42) -> MagicMock:
     inter.channel_id = channel_id
     inter.user = MagicMock(id=user_id)
     return inter
+
+
+def _choice_path(bot: CodexRcBot, choice: discord.app_commands.Choice[str]) -> str:
+    token_record = bot._autocomplete_path_tokens.get(choice.value)
+    return token_record[2] if token_record else choice.value
 
 
 def test_empty_current_lists_home_children(tmp_path: Path, monkeypatch) -> None:
@@ -73,12 +79,23 @@ def test_prefix_filters_children_by_name(tmp_path: Path) -> None:
 def test_history_paths_appear_first_when_matched(tmp_path: Path) -> None:
     """Operator-recent project_path's surface before filesystem entries."""
     (tmp_path / "codex_rc").mkdir()
-    history = ["/Users/alice/work/codex_rc"]
+    history = ["/Users/alice/Project/codex_rc"]
     bot = _make_bot(history_paths=history)
     choices = _project_path_choices(bot, _make_interaction(), "codex")
     # First few choices should be history matches.
     values = [c.value for c in choices]
-    assert values[0] == "/Users/alice/work/codex_rc"
+    assert values[0] == "/Users/alice/Project/codex_rc"
+    assert choices[0].name.startswith("recent  codex_rc")
+
+
+def test_folder_choices_show_name_and_parent(tmp_path: Path) -> None:
+    (tmp_path / "alpha").mkdir()
+    bot = _make_bot()
+    choices = _project_path_choices(bot, _make_interaction(), str(tmp_path) + "/")
+    alpha = next(c for c in choices if _choice_path(bot, c) == str(tmp_path / "alpha"))
+    assert alpha.name.startswith("folder  alpha/  ·")
+    assert tmp_path.name in alpha.name
+    assert len(alpha.name) <= 100
 
 
 def test_unallowed_user_gets_empty_list() -> None:
@@ -106,3 +123,16 @@ def test_long_path_is_displayed_truncated(tmp_path: Path) -> None:
     for c in choices:
         assert len(c.name) <= 100
         assert len(c.value) <= 100
+
+
+def test_long_project_path_is_tokenized(tmp_path: Path) -> None:
+    very_long = tmp_path / ("x" * 120)
+    very_long.mkdir()
+    bot = _make_bot()
+    choices = _project_path_choices(bot, _make_interaction(), str(tmp_path) + "/")
+    assert len(choices) >= 1
+    long_choices = [c for c in choices if c.value.startswith("codexrc-path:")]
+    assert len(long_choices) == 1
+    token = long_choices[0].value
+    assert token in bot._autocomplete_path_tokens
+    assert bot._autocomplete_path_tokens[token][2] == str(very_long)

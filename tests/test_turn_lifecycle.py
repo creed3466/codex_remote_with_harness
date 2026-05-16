@@ -289,13 +289,13 @@ async def test_usage_footer_skipped_for_non_completed_notifs(store, fake_proc, p
 async def test_owner_mention_prefixes_completed_payload(store, fake_proc, post) -> None:
     cs = make_channel_service(
         store=store, proc=fake_proc, post=post,
-        owner_mention_id="271656041958080518",
+        owner_mention_id="111111111111111111",
     )
     from codex_rc.notif_router import DiscordPayload
     payload = DiscordPayload(content="done!", embed=None)
     out = cs._enrich_payload({"method": "turn/completed"}, payload)
     assert out.content is not None
-    assert "<@271656041958080518>" in out.content
+    assert "<@111111111111111111>" in out.content
     assert "done!" in out.content
 
 

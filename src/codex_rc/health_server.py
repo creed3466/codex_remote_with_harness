@@ -26,7 +26,7 @@ from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
-SnapshotProvider = Callable[[], dict]
+SnapshotProvider = Callable[[], dict[str, object]]
 """Callable returning a dict that is merged into the JSON response."""
 
 
@@ -62,7 +62,7 @@ def _build_payload(snapshot: SnapshotProvider, started_at: float) -> bytes:
     except Exception:
         logger.exception("codex_rc: health snapshot provider raised")
         extras = {}
-    payload: dict = {
+    payload: dict[str, object] = {
         "ok": True,
         "uptime_s": int(time.time() - started_at),
     }

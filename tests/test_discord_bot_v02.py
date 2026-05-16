@@ -236,7 +236,7 @@ def test_load_runtime_picks_up_v02_envs(monkeypatch: pytest.MonkeyPatch) -> None
     """Smoke: required token + new envs read without error."""
     monkeypatch.setenv("CODEX_RC_DISCORD_TOKEN", "x")
     monkeypatch.setenv("CODEX_RC_AUTO_APPROVE", "true")
-    monkeypatch.setenv("CODEX_RC_MENTION_ON_COMPLETE", "271656041958080518")
+    monkeypatch.setenv("CODEX_RC_MENTION_ON_COMPLETE", "111111111111111111")
     monkeypatch.setenv("CODEX_RC_AUTO_COMPACT_INPUT_TOKENS", "120000")
     monkeypatch.setenv("CODEX_RC_OPS_CHANNEL_ID", "1234567890")
     from codex_rc.discord_bot import _load_runtime
@@ -247,7 +247,7 @@ def test_load_runtime_picks_up_v02_envs(monkeypatch: pytest.MonkeyPatch) -> None
     # confirm os.environ reflects what the wizard / shell wrote.
     import os as _os
     assert _os.environ["CODEX_RC_AUTO_APPROVE"] == "true"
-    assert _os.environ["CODEX_RC_MENTION_ON_COMPLETE"] == "271656041958080518"
+    assert _os.environ["CODEX_RC_MENTION_ON_COMPLETE"] == "111111111111111111"
     assert _os.environ["CODEX_RC_AUTO_COMPACT_INPUT_TOKENS"] == "120000"
     assert _os.environ["CODEX_RC_OPS_CHANNEL_ID"] == "1234567890"
     assert isinstance(settings.transport_mode, str)

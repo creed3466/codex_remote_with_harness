@@ -21,6 +21,44 @@ from dataclasses import dataclass
 _VALID_FILE_CHANGE_KINDS = frozenset({"A", "M", "D"})
 
 
+def _render_bullet_list(items: tuple[str, ...]) -> str:
+    """Render plain ``- item`` bullets."""
+    return "\n".join(f"- {item}" for item in items)
+
+
+def _render_optional_bullet_list(
+    items: tuple[str, ...], placeholder: str = "- None"
+) -> str:
+    """Render bullets with a placeholder when no items are present."""
+    return _render_bullet_list(items) or placeholder
+
+
+def _render_ordered_list(items: tuple[str, ...]) -> str:
+    """Render ordered items as ``1. item`` rows."""
+    return "\n".join(f"{index + 1}. {item}" for index, item in enumerate(items))
+
+
+def _render_checkbox_list(items: tuple[str, ...]) -> str:
+    """Render verification/checklist style ``- [ ] item`` rows."""
+    return "\n".join(f"- [ ] {item}" for item in items)
+
+
+def _render_file_change_list(file_changes: tuple[FileChange, ...]) -> str:
+    """Render ``- path (A|M|D): summary`` file change rows."""
+    return "\n".join(f"- {fc.path} ({fc.kind}): {fc.summary}" for fc in file_changes)
+
+
+def _join_markdown_sections(
+    title: str, sections: tuple[tuple[str, str], ...]
+) -> str:
+    lines: list[str] = [title]
+    for heading, body in sections:
+        lines.append("")
+        lines.append(heading)
+        lines.append(body)
+    return "\n".join(lines)
+
+
 class HandoffParseError(ValueError):
     """Raised when a stage handoff markdown file is missing required
     sections or contains malformed entries.
@@ -87,35 +125,21 @@ class Stage1To2Handoff:
     output_budget_tokens: int
 
     def to_markdown(self) -> str:
-        trade_offs_block = (
-            "\n".join(f"- {item}" for item in self.trade_offs) or "- None"
-        )
-        hints_block = "\n".join(f"- {item}" for item in self.hints) or "- None"
-        sections = [
+        return _join_markdown_sections(
             f"# Plan Brief — {self.workflow_id}",
-            "",
-            "## Task",
-            self.original_task,
-            "",
-            "## Approved plan",
-            f"{self.selected_plan}: {self.plan_title}",
-            "",
-            "## Plan summary",
-            self.plan_summary,
-            "",
-            "## Selection rationale",
-            self.selection_rationale,
-            "",
-            "## Trade-offs",
-            trade_offs_block,
-            "",
-            "## Hints for design stage",
-            hints_block,
-            "",
-            "## Output budget for stage 2",
-            f"≤ {self.output_budget_tokens} tokens.",
-        ]
-        return "\n".join(sections)
+            (
+                ("## Task", self.original_task),
+                ("## Approved plan", f"{self.selected_plan}: {self.plan_title}"),
+                ("## Plan summary", self.plan_summary),
+                ("## Selection rationale", self.selection_rationale),
+                ("## Trade-offs", _render_optional_bullet_list(self.trade_offs)),
+                ("## Hints for design stage", _render_optional_bullet_list(self.hints)),
+                (
+                    "## Output budget for stage 2",
+                    f"≤ {self.output_budget_tokens} tokens.",
+                ),
+            ),
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -143,47 +167,38 @@ class Stage2To3Handoff:
     output_budget_tokens: int
 
     def to_markdown(self) -> str:
-        arch_block = "\n".join(f"- {d}" for d in self.architecture_decisions)
-        files_block = "\n".join(
-            f"- {fc.path} ({fc.kind}): {fc.summary}" for fc in self.files_to_modify
-        )
-        checklist_block = "\n".join(
-            f"{i + 1}. {step}" for i, step in enumerate(self.implementation_checklist)
-        )
-        test_strategy_block = "\n".join(f"- {s}" for s in self.test_strategy)
-        accept_block = "\n".join(f"- [ ] {c}" for c in self.acceptance_criteria)
-        risks_block = "\n".join(f"- {r}" for r in self.risks) or "- None"
-        sections = [
+        return _join_markdown_sections(
             f"# Design Brief — {self.workflow_id}",
-            "",
-            "## Task",
-            self.original_task,
-            "",
-            "## Approved plan",
-            f"{self.selected_plan}: {self.plan_title}",
-            "",
-            "## Architecture decisions",
-            arch_block,
-            "",
-            "## Files to modify / create",
-            files_block,
-            "",
-            "## Implementation checklist (in order)",
-            checklist_block,
-            "",
-            "## Test strategy",
-            test_strategy_block,
-            "",
-            "## Acceptance criteria",
-            accept_block,
-            "",
-            "## Risks / open questions",
-            risks_block,
-            "",
-            "## Output budget for stage 3",
-            f"≤ {self.output_budget_tokens} tokens.",
-        ]
-        return "\n".join(sections)
+            (
+                ("## Task", self.original_task),
+                ("## Approved plan", f"{self.selected_plan}: {self.plan_title}"),
+                (
+                    "## Architecture decisions",
+                    _render_bullet_list(self.architecture_decisions),
+                ),
+                (
+                    "## Files to modify / create",
+                    _render_file_change_list(self.files_to_modify),
+                ),
+                (
+                    "## Implementation checklist (in order)",
+                    _render_ordered_list(self.implementation_checklist),
+                ),
+                (
+                    "## Test strategy",
+                    _render_bullet_list(self.test_strategy),
+                ),
+                ("## Acceptance criteria", _render_checkbox_list(self.acceptance_criteria)),
+                (
+                    "## Risks / open questions",
+                    _render_optional_bullet_list(self.risks),
+                ),
+                (
+                    "## Output budget for stage 3",
+                    f"≤ {self.output_budget_tokens} tokens.",
+                ),
+            ),
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -206,28 +221,19 @@ class FinalSummary:
     caveats: tuple[str, ...]
 
     def to_markdown(self) -> str:
-        verification_block = "\n".join(f"- {r}" for r in self.verification_results)
-        files_block = "\n".join(f"- {p}" for p in self.files_changed) or "- None"
-        caveats_block = "\n".join(f"- {c}" for c in self.caveats) or "- None"
-        sections = [
+        return _join_markdown_sections(
             f"# Workflow Result — {self.workflow_id}",
-            "",
-            "## What was asked",
-            self.what_was_asked,
-            "",
-            "## What was done",
-            self.what_was_done,
-            "",
-            "## Verification results",
-            verification_block,
-            "",
-            "## Files changed",
-            files_block,
-            "",
-            "## Caveats / follow-ups",
-            caveats_block,
-        ]
-        return "\n".join(sections)
+            (
+                ("## What was asked", self.what_was_asked),
+                ("## What was done", self.what_was_done),
+                (
+                    "## Verification results",
+                    _render_bullet_list(self.verification_results),
+                ),
+                ("## Files changed", _render_optional_bullet_list(self.files_changed)),
+                ("## Caveats / follow-ups", _render_optional_bullet_list(self.caveats)),
+            ),
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -258,47 +264,33 @@ class Stage3To4Handoff:
     output_budget_tokens: int
 
     def to_markdown(self) -> str:
-        files_block = "\n".join(
-            f"- {fc.path} ({fc.kind}): {fc.summary}" for fc in self.files_changed
-        )
-        tests_block = "\n".join(f"- {t}" for t in self.tests_added) or "- none"
-        oos_block = "\n".join(f"- {item}" for item in self.out_of_scope) or "- None"
-        checklist_block = (
-            "\n".join(f"- [ ] {item}" for item in self.verification_checklist)
-            or "- [ ] (no items)"
-        )
-        risks_block = "\n".join(f"- {r}" for r in self.risks) or "- None"
-        sections = [
+        return _join_markdown_sections(
             f"# Verification Brief — {self.workflow_id}",
-            "",
-            "## Task",
-            self.original_task,
-            "",
-            "## Approved plan",
-            f"{self.selected_plan}: {self.plan_title}",
-            "",
-            "## What was implemented",
-            self.what_was_implemented,
-            "",
-            "## Files changed",
-            files_block,
-            "",
-            "## Tests added/modified",
-            tests_block,
-            "",
-            "## Out of scope / deferred",
-            oos_block,
-            "",
-            "## Verification checklist",
-            checklist_block,
-            "",
-            "## Risks / scrutiny areas",
-            risks_block,
-            "",
-            "## Output budget for stage 4",
-            f"≤ {self.output_budget_tokens} tokens.",
-        ]
-        return "\n".join(sections)
+            (
+                ("## Task", self.original_task),
+                ("## Approved plan", f"{self.selected_plan}: {self.plan_title}"),
+                ("## What was implemented", self.what_was_implemented),
+                ("## Files changed", _render_file_change_list(self.files_changed)),
+                (
+                    "## Tests added/modified",
+                    _render_optional_bullet_list(self.tests_added, placeholder="- none"),
+                ),
+                (
+                    "## Out of scope / deferred",
+                    _render_optional_bullet_list(self.out_of_scope),
+                ),
+                (
+                    "## Verification checklist",
+                    _render_checkbox_list(self.verification_checklist)
+                    or "- [ ] (no items)",
+                ),
+                ("## Risks / scrutiny areas", _render_optional_bullet_list(self.risks)),
+                (
+                    "## Output budget for stage 4",
+                    f"≤ {self.output_budget_tokens} tokens.",
+                ),
+            ),
+        )
 
 
 # ----------------------------------------------------------------------

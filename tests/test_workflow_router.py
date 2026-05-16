@@ -8,6 +8,8 @@ from codex_rc.workflow_router import (
     WORKFLOW_DESIGN_MODEL,
     WORKFLOW_SPARK_FALLBACK_MODEL,
     WORKFLOW_SPARK_MODEL,
+    WORKFLOW_VERIFICATION_EFFORT,
+    WORKFLOW_VERIFICATION_MODEL,
     DevelopmentWorkflowRouter,
     extract_plan_metadata,
     parse_workflow_custom_id,
@@ -202,8 +204,12 @@ def test_workflow_resolve_approval_returns_execution_turns_and_seed() -> None:
     assert design.effort == WORKFLOW_DESIGN_EFFORT
     assert impl.model == WORKFLOW_SPARK_MODEL
     assert impl.fallback_model == WORKFLOW_SPARK_FALLBACK_MODEL
-    assert verify.model == WORKFLOW_SPARK_MODEL
-    assert verify.fallback_model == WORKFLOW_SPARK_FALLBACK_MODEL
+    assert verify.model == WORKFLOW_VERIFICATION_MODEL
+    assert verify.effort == WORKFLOW_VERIFICATION_EFFORT
+    assert verify.fallback_model is None
+
+    assert "no placeholder or empty bullets" in design.prompt
+    assert "no placeholder or empty bullets" in impl.prompt
 
     # Every turn knows where its prior context lives and where to write
     # the next handoff. Paths are project-cwd-relative so codex tools

@@ -21,7 +21,6 @@ import plistlib
 import shutil
 import subprocess
 import sys
-import urllib.parse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,13 +33,6 @@ REQUIRED_ENV_KEYS = (
     "CODEX_RC_DISCORD_APP_ID",
     "CODEX_RC_ALLOWED_USER_IDS",
 )
-
-DEFAULT_DISCORD_PERMISSIONS = 85056
-"""Minimal bot permission bits:
-
-View Channel, Send Messages, Embed Links, Read Message History, Add Reactions.
-Slash commands are granted by the ``applications.commands`` OAuth scope.
-"""
 
 
 @dataclass(slots=True, frozen=True)
@@ -171,90 +163,33 @@ def _load_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def _merged_env(cwd: Path, environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    merged = _load_env_file(cwd / ".env")
-    merged.update(dict(environ or os.environ))
-    return merged
-
-
-def build_discord_invite_url(
-    app_id: str,
-    *,
-    permissions: int = DEFAULT_DISCORD_PERMISSIONS,
-) -> str:
-    """Return a Discord OAuth2 install URL for this bot.
-
-    The URL uses the modern ``applications.commands`` scope so slash commands
-    can be registered, and the ``bot`` scope so the gateway can post messages.
-    """
-    app_id = str(app_id).strip()
-    if not app_id:
-        raise ValueError("Discord application ID is required")
-    query = urllib.parse.urlencode(
-        {
-            "client_id": app_id,
-            "permissions": str(int(permissions)),
-            "scope": "bot applications.commands",
-        },
-        quote_via=urllib.parse.quote,
-    )
-    return f"https://discord.com/oauth2/authorize?{query}"
-
-
-def invite_url_from_env(
-    cwd: Path,
-    *,
-    environ: Mapping[str, str] | None = None,
-    permissions: int = DEFAULT_DISCORD_PERMISSIONS,
-) -> str | None:
-    app_id = _merged_env(cwd, environ).get("CODEX_RC_DISCORD_APP_ID", "").strip()
-    if not app_id:
-        return None
-    return build_discord_invite_url(app_id, permissions=permissions)
-
-
 def collect_doctor_checks(
     cwd: Path,
     *,
     environ: Mapping[str, str] | None = None,
-    check_codex_login: bool = False,
-    fix: bool = False,
 ) -> list[DoctorCheck]:
     env_path = cwd / ".env"
-    merged = _merged_env(cwd, environ)
-    if fix:
-        _ensure_runtime_dirs(cwd)
+    file_env = _load_env_file(env_path)
+    merged = dict(file_env)
+    merged.update(dict(environ or os.environ))
 
-    example_exists = (cwd / ".env.example").exists()
     checks = [
         DoctorCheck(".env", env_path.exists(), str(env_path)),
-        DoctorCheck(
-            ".env.example",
-            True,
-            "template present" if example_exists else "using embedded template",
-        ),
+        DoctorCheck(".env.example", (cwd / ".env.example").exists(), "template present"),
     ]
     for key in REQUIRED_ENV_KEYS:
         checks.append(DoctorCheck(key, bool(merged.get(key, "").strip()), "configured"))
-    codex_on_path = shutil.which("codex") is not None
-    checks.append(DoctorCheck("codex", codex_on_path, "codex CLI on PATH"))
-    if check_codex_login and codex_on_path:
-        checks.append(_codex_login_check())
-    elif check_codex_login:
-        checks.append(DoctorCheck("codex login", False, "install codex CLI first"))
-    checks.append(
-        DoctorCheck(
-            "runtime directory",
-            _can_create_dir(cwd / "data" / "state"),
-            str(cwd / "data" / "state"),
-        )
+    checks.extend(
+        [
+            DoctorCheck("codex", shutil.which("codex") is not None, "codex CLI on PATH"),
+            DoctorCheck(
+                "runtime directory",
+                _can_create_dir(cwd / "data" / "state"),
+                str(cwd / "data" / "state"),
+            ),
+        ]
     )
     return checks
-
-
-def _ensure_runtime_dirs(cwd: Path) -> None:
-    for child in ("data/config", "data/logs", "data/state"):
-        (cwd / child).mkdir(parents=True, exist_ok=True)
 
 
 def _can_create_dir(path: Path) -> bool:
@@ -265,30 +200,11 @@ def _can_create_dir(path: Path) -> bool:
     return True
 
 
-def _codex_login_check() -> DoctorCheck:
-    try:
-        result = subprocess.run(
-            ["codex", "login", "status"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return DoctorCheck("codex login", False, "run `codex login` first")
-    if result.returncode == 0:
-        return DoctorCheck("codex login", True, "logged in")
-    return DoctorCheck("codex login", False, "run `codex login` first")
-
-
-def print_doctor(cwd: Path, *, fix: bool = False) -> int:
-    checks = collect_doctor_checks(cwd, check_codex_login=True, fix=fix)
+def print_doctor(cwd: Path) -> int:
+    checks = collect_doctor_checks(cwd)
     for check in checks:
         status = "ok" if check.ok else "missing"
         print(f"{status:7} {check.name} - {check.detail}")
-    invite_url = invite_url_from_env(cwd)
-    if invite_url:
-        print(f"\nDiscord invite URL:\n{invite_url}")
     return 0 if all(check.ok for check in checks) else 1
 
 
@@ -302,6 +218,115 @@ def _launchctl(*args: str) -> int:
 
 def _systemctl(*args: str) -> int:
     return _run_manager(("systemctl", "--user", *args))
+
+
+class GatewayNotInstalled(RuntimeError):
+    """Raised when a self-restart is requested but no service manager unit
+    is registered for the gateway. The caller should surface the message
+    to the operator and NOT terminate the process — there is no
+    supervisor to bring it back up."""
+
+
+def _restart_manager_command(platform: str | None = None) -> list[str]:
+    platform = platform or sys.platform
+    if platform == "darwin":
+        return [
+            "launchctl",
+            "kickstart",
+            "-k",
+            f"gui/{os.getuid()}/{SERVICE_LABEL}",
+        ]
+    if platform.startswith("linux"):
+        return ["systemctl", "--user", "restart", SYSTEMD_UNIT_NAME]
+    raise RuntimeError(
+        "gateway restart is supported only on macOS launchd or Linux systemd"
+    )
+
+
+def _service_install_path(platform: str | None = None) -> Path:
+    platform = platform or sys.platform
+    if platform == "darwin":
+        return _launchd_path()
+    if platform.startswith("linux"):
+        return _systemd_path()
+    raise RuntimeError(
+        "gateway restart is supported only on macOS launchd or Linux systemd"
+    )
+
+
+def _probe_manager_command(platform: str | None = None) -> list[str]:
+    """Manager command that reports whether the service unit is loaded /
+    bootstrapped (not just on disk). ``returncode == 0`` means loaded."""
+    platform = platform or sys.platform
+    if platform == "darwin":
+        return [
+            "launchctl",
+            "print",
+            f"gui/{os.getuid()}/{SERVICE_LABEL}",
+        ]
+    if platform.startswith("linux"):
+        return ["systemctl", "--user", "is-active", "--quiet", SYSTEMD_UNIT_NAME]
+    raise RuntimeError(
+        "gateway restart is supported only on macOS launchd or Linux systemd"
+    )
+
+
+def _service_is_loaded() -> bool:
+    """Return ``True`` only when the service manager has the unit
+    actually loaded — file on disk alone is not enough (the previous
+    incident: ``codex-rc-gateway install`` wrote the plist but never
+    bootstrapped it, ``launchctl kickstart`` then silently 113'd while
+    ``_shutdown_after_restart_ack`` killed the bot anyway).
+    """
+    try:
+        probe = _probe_manager_command()
+    except RuntimeError:
+        return False
+    result = subprocess.run(probe, check=False, capture_output=True)
+    return result.returncode == 0
+
+
+def request_self_restart(delay_seconds: float = 1.0) -> None:
+    """Request installed gateway restart from the running gateway process.
+
+    Raises :class:`GatewayNotInstalled` when the service manager unit is
+    not loaded — file on disk is necessary but not sufficient. Callers
+    must surface that to the operator and skip any ``os._exit``
+    follow-up; otherwise the bot dies with no supervisor to revive it.
+    """
+
+    install_path = _service_install_path()
+    if not install_path.exists():
+        raise GatewayNotInstalled(
+            f"gateway service unit is not installed at {install_path}. "
+            f"Run `codex-rc-gateway install` first, or restart the bot "
+            f"manually."
+        )
+    if not _service_is_loaded():
+        raise GatewayNotInstalled(
+            f"gateway service unit at {install_path} is installed but "
+            f"not loaded into the service manager. Run "
+            f"`codex-rc-gateway start` to bootstrap it, or restart the "
+            f"bot manually."
+        )
+
+    delay_seconds = max(0.0, delay_seconds)
+    manager_command = _restart_manager_command()
+    if delay_seconds == 0.0:
+        args = manager_command
+    else:
+        script = (
+            "import subprocess, time; "
+            f"time.sleep({delay_seconds!r}); "
+            f"subprocess.run({manager_command!r}, check=False)"
+        )
+        args = [sys.executable, "-c", script]
+    subprocess.Popen(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 def start_service() -> int:
@@ -366,24 +391,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "run", parents=[cwd_parent], help="Run the Discord gateway in the foreground"
     )
     sub.add_parser("discord", parents=[cwd_parent], help="Create or update .env for Discord")
-    doctor = sub.add_parser("doctor", parents=[cwd_parent], help="Check local gateway readiness")
-    doctor.add_argument(
-        "--fix",
-        action="store_true",
-        help="Create missing runtime directories before checking",
-    )
-    invite = sub.add_parser(
-        "invite-url",
-        parents=[cwd_parent],
-        help="Print the Discord bot install URL from .env",
-    )
-    invite.add_argument("--app-id", default=None, help="Discord application ID override")
-    invite.add_argument(
-        "--permissions",
-        type=int,
-        default=DEFAULT_DISCORD_PERMISSIONS,
-        help="Discord bot permission integer",
-    )
+    sub.add_parser("doctor", parents=[cwd_parent], help="Check local gateway readiness")
     install = sub.add_parser(
         "install",
         parents=[cwd_parent],
@@ -411,14 +419,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         raise SystemExit(setup_run(cwd=cwd))
     if args.command == "doctor":
-        raise SystemExit(print_doctor(cwd, fix=bool(args.fix)))
-    if args.command == "invite-url":
-        app_id = args.app_id or _merged_env(cwd).get("CODEX_RC_DISCORD_APP_ID", "")
-        try:
-            print(build_discord_invite_url(app_id, permissions=int(args.permissions)))
-        except ValueError as exc:
-            parser.error(str(exc))
-        return
+        raise SystemExit(print_doctor(cwd))
     if args.command == "install":
         path = install_service(cwd, force=bool(args.force))
         print(f"installed {path}")
@@ -445,13 +446,14 @@ if __name__ == "__main__":  # pragma: no cover
 __all__ = [
     "DoctorCheck",
     "ServiceSpec",
-    "build_discord_invite_url",
     "build_launchd_plist",
     "build_systemd_unit",
     "collect_doctor_checks",
     "gateway_argv",
     "install_service",
-    "invite_url_from_env",
     "main",
     "service_spec",
+    "GatewayNotInstalled",
+    "_restart_manager_command",
+    "request_self_restart",
 ]

@@ -180,5 +180,5 @@ First public-ready release. Open-source under MIT.
 - Python 3.13 compatibility: added `audioop-lts` as a dependency on 3.13
   to back-fill the stdlib module discord.py 2.4 still imports.
 
-[0.2.0]: https://github.com/your-org/codex_remote_control/releases/tag/v0.2.0
-[0.1.0]: https://github.com/your-org/codex_remote_control/releases/tag/v0.1.0
+[0.2.0]: https://github.com/creed3466/codex_remote_with_harness/releases/tag/v0.2.0
+[0.1.0]: https://github.com/creed3466/codex_remote_with_harness/releases/tag/v0.1.0

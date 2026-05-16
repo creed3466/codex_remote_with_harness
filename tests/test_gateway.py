@@ -1,33 +1,13 @@
 from __future__ import annotations
 
 import plistlib
-import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from codex_rc import gateway
-
-
-def test_build_discord_invite_url() -> None:
-    url = gateway.build_discord_invite_url("1234567890")
-
-    assert "https://discord.com/oauth2/authorize?" in url
-    assert "client_id=1234567890" in url
-    assert "permissions=85056" in url
-    assert "scope=bot%20applications.commands" in url
-
-
-def test_invite_url_from_env_reads_application_id(tmp_path: Path) -> None:
-    (tmp_path / ".env").write_text(
-        "CODEX_RC_DISCORD_APP_ID=1234567890\n",
-        encoding="utf-8",
-    )
-
-    url = gateway.invite_url_from_env(tmp_path)
-    assert url is not None
-    assert "client_id=1234567890" in url
 
 
 def test_launchd_plist_points_at_project_without_persisting_secrets(
@@ -82,31 +62,6 @@ def test_doctor_reads_env_without_printing_secret(tmp_path: Path) -> None:
     assert "tok" not in "\n".join(check.detail for check in checks)
 
 
-def test_doctor_can_check_codex_login(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    (tmp_path / ".env").write_text(
-        "CODEX_RC_DISCORD_TOKEN=tok\n"
-        "CODEX_RC_DISCORD_APP_ID=app\n"
-        "CODEX_RC_ALLOWED_USER_IDS=uid\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(gateway.shutil, "which", lambda _name: "/usr/bin/codex")
-
-    def fake_run(*_args, **_kwargs):
-        return subprocess.CompletedProcess(["codex"], 0, stdout="private", stderr="")
-
-    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
-
-    checks = gateway.collect_doctor_checks(
-        tmp_path, environ={}, check_codex_login=True
-    )
-    by_name = {check.name: check for check in checks}
-
-    assert by_name["codex login"].ok is True
-    assert by_name["codex login"].detail == "logged in"
-
-
 def test_service_spec_selects_platform_paths(tmp_path: Path) -> None:
     launchd = gateway.service_spec(tmp_path, platform="darwin")
     systemd = gateway.service_spec(tmp_path, platform="linux")
@@ -133,3 +88,172 @@ def test_install_service_refuses_to_replace_without_force(
         gateway.install_service(project)
 
     gateway.install_service(project, force=True)
+
+
+def _install_fake_service_file(tmp_path: Path, name: str) -> Path:
+    """Stand up an empty placeholder so request_self_restart's
+    install-check thinks the service manager unit is registered on
+    disk. Tests still have to fake the manager-probe returncode."""
+    target = tmp_path / name
+    target.write_text("")
+    return target
+
+
+def _fake_loaded_run(returncode: int = 0):
+    """Build a fake ``subprocess.run`` that pretends the manager probe
+    returned ``returncode``. Default 0 → service is loaded."""
+
+    def _run(args, check=False, capture_output=False, **_kw):
+        result = MagicMock()
+        result.returncode = returncode
+        result.stdout = b""
+        result.stderr = b""
+        return result
+
+    return _run
+
+
+def test_request_self_restart_uses_launchd_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(gateway.sys, "platform", "darwin")
+    monkeypatch.setattr(gateway.os, "getuid", lambda: 501)
+    fake_plist = _install_fake_service_file(tmp_path, "dev.codex_rc.gateway.plist")
+    monkeypatch.setattr(gateway, "_launchd_path", lambda: fake_plist)
+    monkeypatch.setattr(gateway.subprocess, "run", _fake_loaded_run(0))
+
+    captured: dict[str, list[str]] = {}
+    monkeypatch.setattr(
+        gateway.subprocess,
+        "Popen",
+        lambda args, stdout, stderr, start_new_session: captured.update(
+            {"args": list(args)}
+        ) or MagicMock(),
+    )
+
+    gateway.request_self_restart(delay_seconds=0.0)
+
+    assert captured["args"] == [
+        "launchctl",
+        "kickstart",
+        "-k",
+        "gui/501/dev.codex_rc.gateway",
+    ]
+
+
+def test_request_self_restart_uses_systemd_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(gateway.sys, "platform", "linux")
+    fake_unit = _install_fake_service_file(tmp_path, "codex-rc-gateway.service")
+    monkeypatch.setattr(gateway, "_systemd_path", lambda: fake_unit)
+    monkeypatch.setattr(gateway.subprocess, "run", _fake_loaded_run(0))
+
+    captured: dict[str, list[str]] = {}
+    monkeypatch.setattr(
+        gateway.subprocess,
+        "Popen",
+        lambda args, stdout, stderr, start_new_session: captured.update(
+            {"args": list(args)}
+        ) or MagicMock(),
+    )
+
+    gateway.request_self_restart(delay_seconds=0.0)
+
+    assert captured["args"] == [
+        "systemctl",
+        "--user",
+        "restart",
+        gateway.SYSTEMD_UNIT_NAME,
+    ]
+
+
+def test_request_self_restart_raises_when_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gateway.sys, "platform", "win32")
+
+    with pytest.raises(RuntimeError, match="supported only"):
+        gateway.request_self_restart(delay_seconds=0.0)
+
+
+def test_request_self_restart_raises_when_launchd_unit_not_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The 2026-05-15 incident #1: ``/codex restart`` killed the bot
+    because ``launchctl kickstart`` silently failed when the plist
+    wasn't installed. With no supervisor, the bot stayed dead. The fix
+    raises a typed error so the button handler can skip ``os._exit``
+    and surface a clear Discord message instead.
+    """
+    monkeypatch.setattr(gateway.sys, "platform", "darwin")
+    monkeypatch.setattr(gateway.os, "getuid", lambda: 501)
+    monkeypatch.setattr(gateway, "_launchd_path", lambda: tmp_path / "absent.plist")
+
+    popen = MagicMock()
+    monkeypatch.setattr(gateway.subprocess, "Popen", popen)
+
+    with pytest.raises(gateway.GatewayNotInstalled, match="not installed"):
+        gateway.request_self_restart(delay_seconds=0.0)
+
+    popen.assert_not_called()
+
+
+def test_request_self_restart_raises_when_systemd_unit_not_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(gateway.sys, "platform", "linux")
+    monkeypatch.setattr(gateway, "_systemd_path", lambda: tmp_path / "absent.service")
+
+    popen = MagicMock()
+    monkeypatch.setattr(gateway.subprocess, "Popen", popen)
+
+    with pytest.raises(gateway.GatewayNotInstalled, match="not installed"):
+        gateway.request_self_restart(delay_seconds=0.0)
+
+    popen.assert_not_called()
+
+
+def test_request_self_restart_raises_when_launchd_plist_present_but_not_loaded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The 2026-05-15 incident #2: after my first fix, the agent ran
+    ``codex-rc-gateway install`` which wrote the plist but never
+    bootstrapped it into launchd. The next ``/codex restart`` click
+    passed the file-exists check, fired ``launchctl kickstart`` which
+    113'd silently (``Could not find service``), and ``os._exit``
+    still killed the bot. The real check has to query the manager,
+    not the disk.
+    """
+    monkeypatch.setattr(gateway.sys, "platform", "darwin")
+    monkeypatch.setattr(gateway.os, "getuid", lambda: 501)
+    plist = _install_fake_service_file(tmp_path, "dev.codex_rc.gateway.plist")
+    monkeypatch.setattr(gateway, "_launchd_path", lambda: plist)
+    # ``launchctl print`` returns 113 when the plist exists but isn't loaded.
+    monkeypatch.setattr(gateway.subprocess, "run", _fake_loaded_run(113))
+
+    popen = MagicMock()
+    monkeypatch.setattr(gateway.subprocess, "Popen", popen)
+
+    with pytest.raises(gateway.GatewayNotInstalled, match="not loaded"):
+        gateway.request_self_restart(delay_seconds=0.0)
+
+    popen.assert_not_called()
+
+
+def test_request_self_restart_raises_when_systemd_unit_present_but_inactive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(gateway.sys, "platform", "linux")
+    unit = _install_fake_service_file(tmp_path, "codex-rc-gateway.service")
+    monkeypatch.setattr(gateway, "_systemd_path", lambda: unit)
+    # ``systemctl is-active`` returns 3 when the unit is inactive.
+    monkeypatch.setattr(gateway.subprocess, "run", _fake_loaded_run(3))
+
+    popen = MagicMock()
+    monkeypatch.setattr(gateway.subprocess, "Popen", popen)
+
+    with pytest.raises(gateway.GatewayNotInstalled, match="not loaded"):
+        gateway.request_self_restart(delay_seconds=0.0)
+
+    popen.assert_not_called()

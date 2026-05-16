@@ -452,7 +452,13 @@ class ApprovalRouter:
                 # only supports a single handler. We respond "method not found"
                 # so the server can fail fast for anything we don't grok yet.
                 return None  # rpc_client will leave it unanswered; safer than guessing
-            request_id = int(raw.get("id"))
+            raw_id = raw.get("id")
+            if isinstance(raw_id, int):
+                request_id = raw_id
+            elif isinstance(raw_id, str):
+                request_id = int(raw_id)
+            else:
+                raise ValueError("server request is missing an integer id")
             prompt = self.start(method, params, request_id=request_id)
             try:
                 await post_prompt(prompt, raw)

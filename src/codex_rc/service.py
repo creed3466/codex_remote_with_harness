@@ -21,9 +21,10 @@ import json
 import logging
 import os
 import random
+import textwrap
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,7 @@ from .workflow_handoff import (
     parse_stage_2_to_3,
     parse_stage_3_to_4,
 )
+from .plan_progress import PlanProgressController
 from .workflow_router import (
     WORKFLOW_ANALYSIS_EFFORT,
     WORKFLOW_ANALYSIS_MODEL,
@@ -135,7 +137,10 @@ class OperatorInstructions:
 
 HANDOFF_IDLE_WAIT_SECONDS = 90.0
 HANDOFF_COMPLETION_TIMEOUT_SECONDS = 180.0
-WORKFLOW_STAGE_COMPLETION_TIMEOUT_SECONDS = 3600.0
+WORKFLOW_STAGE_COMPLETION_TIMEOUT_SECONDS = 900.0  # 15 min; on timeout we
+# fall back to the larger-context model on a fresh ephemeral thread.
+# Was 3600 — Spark (gpt-5.3-codex-spark) was observed locking a channel for
+# the full hour on a degenerate output loop with no turn/completed.
 _START_HELLO_FRAMES = ("h", "he", "hel", "hello")
 
 
@@ -163,93 +168,6 @@ class _TurnCompletionWait:
     thread_id: str
     future: asyncio.Future[None]
     turn_id: str | None = None
-
-
-@dataclass(slots=True)
-class _PlanProgressSnapshot:
-    key: str
-    explanation: str | None
-    rows: list[tuple[str, str]]
-    active_row: int | None
-    completed: bool = False
-
-
-_PLAN_ANSI_COLORS = ("31", "33", "32", "36", "34", "35")
-_PLAN_CONTENT_MAX = 1900
-
-
-def _ansi_clean(text: object, *, limit: int = 160) -> str:
-    cleaned = str(text or "").replace("\x1b", "").replace("```", "'''")
-    cleaned = " ".join(cleaned.split())
-    return cleaned[:limit] if len(cleaned) > limit else cleaned
-
-
-def _plan_message_key(params: JsonObj, fallback_turn_id: str | None) -> str:
-    thread_id = str(params.get("threadId") or "thread")
-    turn_id = _turn_id_from_notification(params) or fallback_turn_id or "turn"
-    return f"plan:{thread_id}:{turn_id}"
-
-
-def _plan_snapshot_from_notification(
-    params: JsonObj,
-    *,
-    fallback_turn_id: str | None,
-    previous: _PlanProgressSnapshot | None = None,
-) -> _PlanProgressSnapshot:
-    rows: list[tuple[str, str]] = []
-    active_row: int | None = None
-    for raw_step in params.get("plan") or []:
-        step = raw_step if isinstance(raw_step, dict) else {}
-        status = str(step.get("status") or "pending")
-        text = _ansi_clean(step.get("step") or step.get("text") or "(step)")
-        if status == "in_progress" and active_row is None:
-            active_row = len(rows)
-        rows.append((status, text))
-    if not rows and previous is not None:
-        rows = list(previous.rows)
-        active_row = previous.active_row
-    explanation = params.get("explanation")
-    return _PlanProgressSnapshot(
-        key=_plan_message_key(params, fallback_turn_id),
-        explanation=_ansi_clean(explanation, limit=240) if explanation else None,
-        rows=rows,
-        active_row=active_row,
-    )
-
-
-def _highlight_active_text(text: str, *, tick: int) -> str:
-    if not text:
-        return text
-    char_index = tick % len(text)
-    color = _PLAN_ANSI_COLORS[tick % len(_PLAN_ANSI_COLORS)]
-    return (
-        f"{text[:char_index]}\x1b[{color}m{text[char_index]}\x1b[0m"
-        f"{text[char_index + 1:]}"
-    )
-
-
-def _render_plan_progress(snapshot: _PlanProgressSnapshot, *, tick: int) -> str:
-    lines: list[str] = []
-    if snapshot.explanation:
-        lines.append(snapshot.explanation)
-        lines.append("")
-    rows = snapshot.rows or [("pending", "(empty plan)")]
-    for i, (status, text) in enumerate(rows):
-        if snapshot.completed and status == "in_progress":
-            status = "completed"
-        if status == "completed":
-            line = f"✅ {text}"
-        elif status == "in_progress":
-            active_text = _highlight_active_text(text, tick=tick) if i == snapshot.active_row else text
-            line = f"▶ {active_text}"
-        else:
-            line = f"⬜ {text}"
-        lines.append(line)
-    body = "\n".join(lines).rstrip()
-    content = f"```ansi\n{body}\n```"
-    if len(content) <= _PLAN_CONTENT_MAX:
-        return content
-    return f"```ansi\n{body[: _PLAN_CONTENT_MAX - 24].rstrip()}\n... truncated\n```"
 
 
 def _resolve_soul_path() -> Path:
@@ -582,9 +500,7 @@ def _is_context_window_error(exc: BaseException) -> bool:
     return any(marker in text for marker in markers)
 
 
-def _workflow_fallback_reason(
-    exc: BaseException, turn: "WorkflowExecutionTurn"
-) -> str | None:
+def _workflow_fallback_reason(exc: BaseException, turn: WorkflowExecutionTurn) -> str | None:
     """Classify ``exc`` for the workflow stage fallback decision.
 
     Returns the human-readable reason when a fallback is warranted, or
@@ -777,9 +693,11 @@ class ChannelService:
         # Cat-of-patience: one animated message per turn (edit-cycled emoji).
         self._cat_task: asyncio.Task[None] | None = None
         self._cat_last_turn_id: str | None = None
-        self._plan_snapshot: _PlanProgressSnapshot | None = None
-        self._plan_task: asyncio.Task[None] | None = None
-        self._plan_tick: int = 0
+        self._plan_progress = PlanProgressController(
+            channel_id=self.channel_id,
+            post_update=self.post_update,
+            post_lock=self._post_lock,
+        )
         cats_data = _load_cats_full(cats_path)
         cats = cats_data.get("cats", [])
         self._cats: list[dict[str, Any]] = (
@@ -865,7 +783,7 @@ class ChannelService:
                 logger.exception("codex_rc: error applying drain resolution")
         await self._cancel_workflow_execution()
         self._cancel_cat()
-        self._cancel_plan_progress()
+        self._plan_progress.cancel()
         await self._create_handoff_on_stop()
         if self._pump_task and not self._pump_task.done():
             self._pump_task.cancel()
@@ -1055,7 +973,7 @@ class ChannelService:
         self._pump_task = None
         # Cancel any in-flight cat animation.
         self._cancel_cat()
-        self._cancel_plan_progress()
+        self._plan_progress.cancel()
         # Tear the old proc down (idempotent — child is already dead).
         with contextlib.suppress(Exception):
             await self.proc.stop()
@@ -1138,6 +1056,33 @@ class ChannelService:
         instead of ``turn/start`` — appending to the in-flight turn rather
         than queueing a new one.
         """
+        workflow_waiting = (
+            self._workflow_execution_task is not None
+            and not self._workflow_execution_task.done()
+        )
+        stage_waiting = (
+            self._workflow_turn_wait is not None
+            and not self._workflow_turn_wait.future.done()
+        )
+        if workflow_waiting or stage_waiting:
+            # Workflow ephemeral stages own the conversation until they
+            # complete; routing user input to the main thread mid-stage
+            # used to hit ``turn/steer`` with a stale ephemeral turn id
+            # and surface as a raw RpcError. Post a clear notice instead.
+            with contextlib.suppress(Exception):
+                await self._post_system(
+                    embed=DiscordEmbed(
+                        title="⏳ Workflow in progress",
+                        description=(
+                            "A development workflow stage is still running. "
+                            "Your message was not sent — wait for the workflow "
+                            "to finish, or click **Cancel workflow** on the "
+                            "approval prompt to stop it."
+                        ),
+                        color=COLOR_WARN,
+                    )
+                )
+            return
         await self._send_text(text, image_urls=image_urls, workflow_wrap=True)
 
     async def _send_text(
@@ -1342,10 +1287,51 @@ class ChannelService:
                     decision.workflow_id, current_stage=turn.stage
                 )
                 await self._run_workflow_stage_turn(turn)
-                # Validate the handoff the agent wrote. Parse failure
-                # triggers one retry on the same ephemeral-thread cycle;
-                # a second failure aborts the workflow.
-                await self._validate_stage_handoff(turn)
+                try:
+                    await self._validate_stage_handoff(turn)
+                except HandoffParseError as exc:
+                    malformed_handoff = self._workflow_store.read_handoff(
+                        turn.workflow_id, stage=turn.stage
+                    )
+                    if malformed_handoff is None:
+                        raise RuntimeError(
+                            f"stage {turn.stage} ({turn.title}) finished without writing "
+                            f"{turn.next_handoff_relpath}"
+                        ) from exc
+
+                    logger.warning(
+                        "codex_rc: workflow schema repair channel=%s workflow=%s "
+                        "stage=%s error=%s",
+                        self.channel_id,
+                        decision.workflow_id,
+                        turn.stage,
+                        exc,
+                    )
+                    with contextlib.suppress(Exception):
+                        await self._post_system(
+                            embed=DiscordEmbed(
+                                title="⚠️ Workflow handoff schema repair",
+                                description=(
+                                    f"Stage {turn.stage} (`{turn.title}`) did "
+                                    f"not produce a parse-valid handoff for "
+                                    f"{turn.next_handoff_relpath}.\n"
+                                    f"Retrying once with repair instructions.\n"
+                                    f"`{exc}`"
+                                ),
+                                color=COLOR_WARN,
+                            )
+                        )
+
+                    repair_turn = replace(
+                        turn,
+                        prompt=self._build_schema_repair_prompt(
+                            turn=turn,
+                            parse_error=str(exc),
+                            malformed_content=malformed_handoff,
+                        ),
+                    )
+                    await self._run_workflow_stage_turn(repair_turn)
+                    await self._validate_stage_handoff(repair_turn)
             await self._finalize_workflow(decision)
             self.workflow.complete_execution()
         except asyncio.CancelledError:
@@ -1394,6 +1380,7 @@ class ChannelService:
         thread_id = await self._create_ephemeral_thread(
             workflow_id=turn.workflow_id, stage=turn.stage
         )
+        reason: str | None
         try:
             await self._start_and_wait_workflow_turn(
                 turn, model=turn.model, thread_id=thread_id
@@ -1403,27 +1390,46 @@ class ChannelService:
             reason = _workflow_fallback_reason(exc, turn)
             if reason is None:
                 raise
-            logger.info(
-                "codex_rc: workflow model fallback channel=%s stage=%s model=%s "
-                "fallback=%s reason=%s",
-                self.channel_id,
-                turn.stage,
-                turn.model,
-                turn.fallback_model,
-                reason,
-            )
+        except TimeoutError:
+            # Spark (gpt-5.3-codex-spark) was observed dropping into a
+            # degenerate output loop with no turn/completed. Treat the
+            # stage timeout the same as a context-window error: try to
+            # interrupt the stuck turn, then fall back on a fresh
+            # ephemeral thread + fallback model.
+            if not turn.fallback_model:
+                raise
             with contextlib.suppress(Exception):
-                await self._post_system(
-                    embed=DiscordEmbed(
-                        title="⚠️ Workflow model fallback",
-                        description=(
-                            f"Stage {turn.stage} `{turn.title}` failed on "
-                            f"`{turn.model}` ({reason}). Retrying with "
-                            f"`{turn.fallback_model}` on a fresh thread."
-                        ),
-                        color=COLOR_WARN,
-                    )
+                await self.proc.request(
+                    "turn/interrupt",
+                    {"threadId": thread_id},
+                    timeout=5.0,
                 )
+            reason = (
+                f"timeout after "
+                f"{int(WORKFLOW_STAGE_COMPLETION_TIMEOUT_SECONDS)}s"
+            )
+
+        logger.info(
+            "codex_rc: workflow model fallback channel=%s stage=%s model=%s "
+            "fallback=%s reason=%s",
+            self.channel_id,
+            turn.stage,
+            turn.model,
+            turn.fallback_model,
+            reason,
+        )
+        with contextlib.suppress(Exception):
+            await self._post_system(
+                embed=DiscordEmbed(
+                    title="⚠️ Workflow model fallback",
+                    description=(
+                        f"Stage {turn.stage} `{turn.title}` failed on "
+                        f"`{turn.model}` ({reason}). Retrying with "
+                        f"`{turn.fallback_model}` on a fresh thread."
+                    ),
+                    color=COLOR_WARN,
+                )
+            )
         # Fall back: fresh ephemeral thread + fallback model. The original
         # thread is left for codex to GC — ephemeral threads aren't
         # persisted, so there's nothing to clean up explicitly.
@@ -1527,9 +1533,8 @@ class ChannelService:
 
         Raises if the file is missing or doesn't conform to the per-stage
         schema. The outer ``_run_workflow_execution`` catches and posts a
-        clear error embed; a future iteration may add a one-shot
-        same-stage retry that injects the parse error into a follow-up
-        prompt.
+        clear error embed; parse failures run one repair pass before
+        failing the workflow.
         """
         content = self._workflow_store.read_handoff(
             turn.workflow_id, stage=turn.stage
@@ -1547,10 +1552,44 @@ class ChannelService:
             elif turn.stage == 4:
                 parse_final_summary(content)
         except HandoffParseError as exc:
-            raise RuntimeError(
+            raise HandoffParseError(
                 f"stage {turn.stage} ({turn.title}) handoff failed schema "
                 f"validation: {exc}"
             ) from exc
+
+    def _build_schema_repair_prompt(
+        self,
+        *,
+        turn: WorkflowExecutionTurn,
+        parse_error: str,
+        malformed_content: str,
+    ) -> str:
+        return textwrap.dedent(
+            f"""\
+            <<CODEX_RC_WORKFLOW_STAGE id="{turn.workflow_id}" stage="{turn.stage}" title="{turn.title} — Schema Repair">
+            You are repairing a malformed stage handoff for:
+
+            - Stage title: {turn.title}
+            - Target handoff path: {turn.next_handoff_relpath}
+
+            The previous handoff parse failed with:
+
+            {parse_error}
+
+            Existing file content:
+
+            ```md
+            {malformed_content.rstrip()}
+            ```
+
+            Rewrite only this handoff file at the same path, with the same
+            stage schema and concrete entries. Do not modify other files.
+
+            Keep the repair output strictly to the required schema. The rest
+            of the workflow context is unchanged.
+            </CODEX_RC_WORKFLOW_STAGE>
+            """
+        ).strip()
 
     async def _finalize_workflow(self, decision: WorkflowDecision) -> None:
         """Post the stage-4 summary to Discord and inject it into the
@@ -1925,19 +1964,28 @@ class ChannelService:
                     "codex_rc: pump#%d channel=%s method=%s", count, self.channel_id, method
                 )
                 handoff_internal = self._capture_handoff_notification(notif)
+                workflow_internal = self._is_active_workflow_turn_notification(notif)
+                fallback_turn_id = self._active_turn_id
                 plan_handled = False
                 if not handoff_internal:
                     self._maybe_cat_trigger(notif)
                 await self._update_turn_state(notif)
                 self._observe_workflow_turn_completion(notif)
                 if not handoff_internal:
-                    plan_handled = await self._handle_plan_progress(notif)
+                    plan_handled = await self._handle_plan_progress(
+                        notif,
+                        fallback_turn_id=fallback_turn_id,
+                    )
                 self._update_thread_metadata_cache(notif)
                 self._update_usage_cache(notif)
                 if handoff_internal:
                     continue
                 await self._maybe_auto_compact(notif)
-                payloads = [] if plan_handled else self.notif.route(notif)
+                payloads = (
+                    []
+                    if plan_handled or workflow_internal
+                    else self.notif.route(notif)
+                )
                 payloads = [self._clean_workflow_payload(p) for p in payloads]
                 payloads = [self._enrich_payload(notif, p) for p in payloads]
                 workflow_prompt = self.workflow.observe_notification(notif)
@@ -2067,12 +2115,30 @@ class ChannelService:
 
         return bool(turn_id == capture.turn_id)
 
+    def _is_active_workflow_turn_notification(self, notif: JsonObj) -> bool:
+        wait = self._workflow_turn_wait
+        if wait is None:
+            return False
+        params = notif.get("params") or {}
+        thread_id = str(params.get("threadId") or "")
+        return thread_id == wait.thread_id
+
     # ----------------------------------------------------- turn state / hooks
 
     async def _update_turn_state(self, notif: JsonObj) -> None:
-        """Track active turn id (drives steer routing + reaction lifecycle)."""
+        """Track active turn id (drives steer routing + reaction lifecycle).
+
+        Workflow ephemeral-thread events are filtered out so they don't
+        poison ``_active_turn_id`` on the main channel session. Without
+        this guard, the next user message during workflow execution
+        would issue ``turn/steer`` against the main thread with a
+        turn-id that belongs to the ephemeral — codex rejects with
+        ``no active turn to steer`` and the bot raises uncaught.
+        """
         method = notif.get("method")
         params = notif.get("params") or {}
+        if self._is_active_workflow_turn_notification(notif):
+            return
         if method == "turn/started":
             turn = params.get("turn") or {}
             turn_id = str(turn.get("id") or params.get("turnId") or "")
@@ -2301,99 +2367,19 @@ class ChannelService:
 
     # ---------------------------------------------------------- plan progress
 
-    async def _handle_plan_progress(self, notif: JsonObj) -> bool:
-        method = notif.get("method")
-        params = notif.get("params") or {}
-        if method == "turn/plan/updated":
-            if self.post_update is None:
-                return True
-            previous = self._plan_snapshot
-            snapshot = _plan_snapshot_from_notification(
-                params,
-                fallback_turn_id=self._active_turn_id,
-                previous=previous,
-            )
-            if (
-                previous is None
-                or previous.key != snapshot.key
-                or previous.active_row != snapshot.active_row
-            ):
-                self._plan_tick = 0
-            self._plan_snapshot = snapshot
-            await self._post_plan_progress_frame()
-            self._ensure_plan_animation()
-            return True
-        if method in {"turn/completed", "error"}:
-            await self._finish_plan_progress(completed=method == "turn/completed")
-        return False
-
-    def _ensure_plan_animation(self) -> None:
-        if self.post_update is None or self._plan_snapshot is None:
-            return
-        if self._plan_snapshot.active_row is None:
-            return
-        if self._plan_task and not self._plan_task.done():
-            return
-        self._plan_task = asyncio.create_task(
-            self._animate_plan_progress(),
-            name=f"codex-rc-plan-{self.channel_id}",
+    async def _handle_plan_progress(
+        self,
+        notif: JsonObj,
+        *,
+        fallback_turn_id: str | None = None,
+    ) -> bool:
+        return await self._plan_progress.handle_notification(
+            notif,
+            fallback_turn_id=fallback_turn_id,
         )
 
-    async def _step_plan_animation_frame(self) -> bool:
-        if self._plan_snapshot is None or self._plan_snapshot.active_row is None:
-            return False
-        self._plan_tick += 1
-        await self._post_plan_progress_frame()
-        return True
-
-    async def _animate_plan_progress(self) -> None:
-        try:
-            while self._plan_snapshot is not None and not self._plan_snapshot.completed:
-                if not await self._step_plan_animation_frame():
-                    return
-                if self._plan_snapshot is None or self._plan_snapshot.completed:
-                    return
-                await asyncio.sleep(1.0)
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            logger.exception("codex_rc: plan progress animation failed")
-
-    async def _finish_plan_progress(self, *, completed: bool) -> None:
-        snapshot = self._plan_snapshot
-        if snapshot is None:
-            return
-        self._cancel_plan_progress_task()
-        snapshot.completed = completed
-        self._plan_snapshot = snapshot
-        await self._post_plan_progress_frame()
-        self._plan_snapshot = None
-
     def _cancel_plan_progress(self) -> None:
-        self._cancel_plan_progress_task()
-        self._plan_snapshot = None
-
-    def _cancel_plan_progress_task(self) -> None:
-        task = self._plan_task
-        self._plan_task = None
-        if task and not task.done():
-            task.cancel()
-
-    async def _post_plan_progress_frame(self) -> None:
-        if self.post_update is None or self._plan_snapshot is None:
-            return
-        payload = {
-            "content": _render_plan_progress(self._plan_snapshot, tick=self._plan_tick)
-        }
-        try:
-            async with self._post_lock:
-                await self.post_update(
-                    self.channel_id,
-                    self._plan_snapshot.key,
-                    payload,
-                )
-        except Exception:
-            logger.exception("codex_rc: failed to update plan progress")
+        self._plan_progress.cancel()
 
     # ------------------------------------------------------------- cat-of-patience
 
@@ -2920,6 +2906,13 @@ class Service:
 
     def is_active(self, channel_id: str) -> bool:
         return channel_id in self._channels
+
+    def has_session_record(self, channel_id: str) -> bool:
+        """Return whether a persisted session row exists for the channel.
+
+        This intentionally ignores whether a live ChannelService is running.
+        """
+        return self.store.get(channel_id) is not None
 
 
 def _slug(channel_id: str) -> str:

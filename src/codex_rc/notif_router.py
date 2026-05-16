@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 JsonObj = dict[str, Any]
+NotificationHandler = Callable[["NotifRouter", JsonObj], list["DiscordPayload"]]
 
 # Discord limits (https://discord.com/developers/docs/resources/channel)
 DISCORD_CONTENT_MAX = 2000
@@ -573,7 +575,7 @@ class NotifRouter:
 
         # Failure path: surface why so the user can act.
         if isinstance(exit_code, int) and exit_code != 0:
-            if exit_code == 127:
+            if exit_code in {127, 128}:
                 return []
             tail = _exec_failure_excerpt(output)
             desc = f"exit `{exit_code}`"
@@ -802,7 +804,7 @@ def _diff_per_file_table(stats: list[_DiffStat], *, max_rows: int = 12) -> str:
 
 # Dispatch table built after methods exist on the class so the reference is
 # resolvable.
-_HANDLERS: dict[str, Any] = {
+_HANDLERS: dict[str, NotificationHandler] = {
     "turn/completed": NotifRouter._on_turn_completed,
     "turn/diff/updated": NotifRouter._on_turn_diff_updated,
     "turn/plan/updated": NotifRouter._on_turn_plan_updated,

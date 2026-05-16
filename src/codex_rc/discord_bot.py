@@ -24,13 +24,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 import shlex
+import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import discord
 from discord import app_commands
 
 from .config import Settings, load_settings_from_env
+from .gateway import request_self_restart
 from .service import Service, permission_preset_config, permission_preset_names
 from .session_store import SessionStore
 from .workflow_router import WORKFLOW_CUSTOM_ID_PREFIX, parse_workflow_custom_id
@@ -94,6 +99,98 @@ def _payload_to_message_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
 
 _AUTOCOMPLETE_LIMIT = 25
 _AUTOCOMPLETE_HISTORY_SLOTS = 5
+_AUTOCOMPLETE_PATH_TOKEN_PREFIX = "codexrc-path:"
+_AUTOCOMPLETE_PATH_TOKEN_TTL_SECONDS = 300
+_AUTOCOMPLETE_CHOICE_TEXT_LIMIT = 100
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectPathSuggestion:
+    path: str
+    source: str
+
+
+def _compact_choice_text(text: str, limit: int = _AUTOCOMPLETE_CHOICE_TEXT_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    head_len = min(48, limit // 2)
+    tail_len = limit - head_len - 3
+    return f"{text[:head_len]}...{text[-tail_len:]}"
+
+
+def _project_path_choice_name(suggestion: _ProjectPathSuggestion) -> str:
+    path = Path(suggestion.path)
+    basename = path.name or suggestion.path
+    if suggestion.source == "history":
+        label = f"recent  {basename}  ·  {suggestion.path}"
+    else:
+        parent = str(path.parent)
+        label = f"folder  {basename}/  ·  {parent}"
+    return _compact_choice_text(label)
+
+
+def _recent_project_path_suggestions(
+    bot: CodexRcBot, current: str
+) -> list[_ProjectPathSuggestion]:
+    seen: set[str] = set()
+    suggestions: list[_ProjectPathSuggestion] = []
+    current_lower = current.lower()
+    for sess in bot.service.store.list_all():
+        path = str(sess.project_path)
+        if path in seen:
+            continue
+        seen.add(path)
+        if not current_lower or current_lower in path.lower():
+            suggestions.append(_ProjectPathSuggestion(path=path, source="history"))
+        if len(suggestions) >= _AUTOCOMPLETE_HISTORY_SLOTS:
+            break
+    return suggestions
+
+
+def _autocomplete_scan_root(current: str) -> tuple[Path, str]:
+    if not current:
+        return Path.home(), ""
+    expanded_input = Path(current).expanduser()
+    if expanded_input.is_dir():
+        return expanded_input, ""
+    parent = expanded_input.parent
+    return parent if parent.is_dir() else Path.home(), expanded_input.name
+
+
+def _filesystem_project_path_suggestions(current: str) -> list[_ProjectPathSuggestion]:
+    base, name_prefix = _autocomplete_scan_root(current)
+    prefix_lower = name_prefix.lower()
+    suggestions: list[_ProjectPathSuggestion] = []
+    try:
+        children = sorted(base.iterdir(), key=lambda child: child.name.lower())
+    except (OSError, PermissionError):
+        return suggestions
+    for child in children:
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if prefix_lower and not child.name.lower().startswith(prefix_lower):
+            continue
+        suggestions.append(_ProjectPathSuggestion(path=str(child), source="folder"))
+        if len(suggestions) >= _AUTOCOMPLETE_LIMIT:
+            break
+    return suggestions
+
+
+def _merge_project_path_suggestions(
+    suggestions: list[_ProjectPathSuggestion],
+) -> list[_ProjectPathSuggestion]:
+    merged: list[_ProjectPathSuggestion] = []
+    seen: set[str] = set()
+    for suggestion in suggestions:
+        if suggestion.path in seen:
+            continue
+        seen.add(suggestion.path)
+        merged.append(suggestion)
+        if len(merged) >= _AUTOCOMPLETE_LIMIT:
+            break
+    return merged
 
 
 def _project_path_choices(
@@ -103,8 +200,6 @@ def _project_path_choices(
     filesystem children of the prefix the user is typing. Capped at
     Discord's 25-item limit per autocomplete response.
     """
-    from pathlib import Path as _Path
-
     # Defense-in-depth: same allowlist gating as the rest of the bot.
     if interaction.channel_id is None or not bot.access.allows(
         str(interaction.user.id), str(interaction.channel_id)
@@ -112,71 +207,37 @@ def _project_path_choices(
         return []
 
     current = (current or "").strip()
-    expanded_input = _Path(current).expanduser() if current else None
-
-    # 1) History from memory.json — operator's recent project paths.
-    seen: set[str] = set()
-    history: list[str] = []
-    for sess in bot.service.store.list_all():
-        p = sess.project_path
-        if p in seen:
-            continue
-        seen.add(p)
-        if not current or current.lower() in p.lower():
-            history.append(p)
-        if len(history) >= _AUTOCOMPLETE_HISTORY_SLOTS:
-            break
-
-    # 2) Filesystem children of the directory the user is typing into.
-    fs_items: list[str] = []
-    if expanded_input is not None:
-        if expanded_input.is_dir():
-            base = expanded_input
-            name_prefix = ""
-        else:
-            parent = expanded_input.parent
-            base = parent if parent.is_dir() else _Path.home()
-            name_prefix = expanded_input.name
-    else:
-        base = _Path.home()
-        name_prefix = ""
-
-    try:
-        for child in sorted(base.iterdir(), key=lambda c: c.name.lower()):
-            if not child.is_dir():
-                continue
-            if child.name.startswith("."):
-                continue
-            if name_prefix and not child.name.lower().startswith(name_prefix.lower()):
-                continue
-            fs_items.append(str(child))
-            if len(fs_items) >= _AUTOCOMPLETE_LIMIT:
-                break
-    except (OSError, PermissionError):
-        pass
-
-    # 3) Merge: history first, then filesystem; dedupe; truncate to 25.
-    combined: list[str] = []
-    for p in history + fs_items:
-        if p in combined:
-            continue
-        combined.append(p)
-        if len(combined) >= _AUTOCOMPLETE_LIMIT:
-            break
+    suggestions = _merge_project_path_suggestions(
+        _recent_project_path_suggestions(bot, current)
+        + _filesystem_project_path_suggestions(current)
+    )
 
     # Discord caps each Choice name + value at 100 chars; truncate the
     # display name so long absolute paths still surface a tail.
     out: list[app_commands.Choice[str]] = []
-    for p in combined:
-        display = p if len(p) <= 95 else "…" + p[-94:]
-        value = p[:100]
-        out.append(app_commands.Choice(name=display, value=value))
+    for suggestion in suggestions:
+        value = suggestion.path
+        if len(value) > _AUTOCOMPLETE_CHOICE_TEXT_LIMIT:
+            value = bot._register_project_path_token(
+                channel_id=str(interaction.channel_id),
+                user_id=str(interaction.user.id),
+                project_path=suggestion.path,
+            )
+        out.append(
+            app_commands.Choice(
+                name=_project_path_choice_name(suggestion),
+                value=value,
+            )
+        )
     return out
 
 
 # --------------------------------------------------------- resume picker view
 
 RESUME_BUTTON_PREFIX = "codex_rc:resume:"
+GATEWAY_RESTART_BUTTON_PREFIX = "codex_rc:gateway_restart:"
+_GATEWAY_RESTART_EXIT_SECONDS = 0.5
+_GATEWAY_RESTART_MANAGER_DELAY_SECONDS = 1.0
 RESUME_PICKER_LIMIT = 5
 
 
@@ -190,7 +251,7 @@ def _format_age(seconds: float) -> str:
     return f"{int(seconds / 86400)}d ago"
 
 
-class _ResumeButton(discord.ui.Button):
+class _ResumeButton(discord.ui.Button[discord.ui.View]):
     """One button per recent handoff; clicking starts a fresh handoff thread."""
 
     def __init__(
@@ -245,18 +306,76 @@ class _ResumeButton(discord.ui.Button):
         )
 
 
+async def _shutdown_after_restart_ack(
+    bot: CodexRcBot,
+    delay_seconds: float = _GATEWAY_RESTART_EXIT_SECONDS,
+) -> None:
+    await asyncio.sleep(delay_seconds)
+    try:
+        await bot.close()
+    except Exception:
+        logger.debug("failed to close bot before restart", exc_info=True)
+    os._exit(0)
+
+
+class _RestartGatewayButton(discord.ui.Button[discord.ui.View]):
+    """Confirms and requests a gateway process restart."""
+
+    def __init__(
+        self,
+        *,
+        bot: CodexRcBot,
+        channel_id: str,
+    ) -> None:
+        super().__init__(
+            label="Restart gateway",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"{GATEWAY_RESTART_BUTTON_PREFIX}{channel_id}",
+        )
+        self._bot = bot
+        self._channel_id = channel_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not self._bot.access.allows(
+            str(interaction.user.id),
+            self._channel_id,
+        ):
+            await interaction.response.send_message(
+                "❌ Not allowed.", ephemeral=True
+            )
+            return
+        if str(interaction.channel_id) != self._channel_id:
+            await interaction.response.send_message(
+                "❌ Channel mismatch.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        try:
+            request_self_restart(delay_seconds=_GATEWAY_RESTART_MANAGER_DELAY_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("gateway restart request failed")
+            await interaction.followup.send(
+                f"❌ gateway restart failed: {exc}",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            "♻️ Gateway restart requested. Restarting gateway process."
+        )
+        asyncio.create_task(_shutdown_after_restart_ack(self._bot))
+
+
 def _build_resume_picker(
-    bot: CodexRcBot, channel_id: str, handoffs: list
+    bot: CodexRcBot, channel_id: str, handoffs: list[Any]
 ) -> tuple[discord.Embed, discord.ui.View]:
     """Build (embed, view) for the resume picker. ``handoffs`` is expected
     to be capped at RESUME_PICKER_LIMIT."""
-    import time as _time
-
     view = discord.ui.View(timeout=300)
     lines: list[str] = []
+    now = time.time()
     for h in handoffs:
         short = (h.preview or "(no preview)")[:32]
-        age = _format_age(max(0.0, _time.time() - h.updated_at))
+        age = _format_age(max(0.0, now - h.updated_at))
         label = f"{short} · {h.handoff_id[:8]}"
         view.add_item(
             _ResumeButton(
@@ -278,8 +397,35 @@ def _build_resume_picker(
     return embed, view
 
 
+def _build_restart_confirmation_view(
+    bot: CodexRcBot, channel_id: str
+) -> discord.ui.View:
+    view = discord.ui.View(timeout=120)
+    view.add_item(_RestartGatewayButton(bot=bot, channel_id=channel_id))
+    return view
+
+
+def _build_thread_history_embed(threads: list[Any]) -> discord.Embed:
+    lines: list[str] = []
+    now = time.time()
+    for thread in threads:
+        preview = (thread.preview or "(no preview)")[:80]
+        lines.append(
+            f"`{thread.codex_thread_id[:8]}` · **{thread.turn_count}** turns · "
+            f"{_format_age(max(0.0, now - thread.last_used_at))}\n  {preview}"
+        )
+    embed = discord.Embed(
+        title="🧵 Thread history",
+        description="\n\n".join(lines),
+        color=0x3498DB,
+    )
+    embed.set_footer(text="Resume now uses handoff ids from /codex stop")
+    return embed
+
+
 _VALID_ACTIONS: frozenset[str] = frozenset({
-    "start", "stop", "status", "capabilities", "history", "resume", "new",
+    "start", "stop", "restart", "status", "capabilities", "history", "resume",
+    "new",
     "continue", "cancel", "rollback",
     "model", "permissions", "review", "fork", "goal",
     "compact", "exit", "quit",
@@ -297,6 +443,7 @@ _ACTION_CHOICES = [
     app_commands.Choice(name="Continue latest", value="continue"),
     app_commands.Choice(name="Start project", value="start"),
     app_commands.Choice(name="Stop session", value="stop"),
+    app_commands.Choice(name="Restart gateway", value="restart"),
     app_commands.Choice(name="Session status", value="status"),
     app_commands.Choice(name="Capability audit", value="capabilities"),
     app_commands.Choice(name="New thread", value="new"),
@@ -507,9 +654,67 @@ class CodexRcBot(discord.Client):
         self._last_user_message: dict[str, discord.Message] = {}
         # Editable status messages keyed by (channel_id, logical_key).
         self._editable_messages: dict[tuple[str, str], discord.Message] = {}
+        # Autocomplete path-token mapping:
+        # {token: (channel_id, user_id, full_path, expires_at)}.
+        self._autocomplete_path_tokens: dict[str, tuple[str, str, str, float]] = {}
         # Users we've already warned about not being on the allowlist.
         self._warned_blocked_users: set[str] = set()
         self._register_commands()
+
+    # ------------------------------------------------------ autocomplete token helpers
+
+    def _is_autocomplete_path_token(self, value: str) -> bool:
+        if not value.startswith(_AUTOCOMPLETE_PATH_TOKEN_PREFIX):
+            return False
+        suffix = value[len(_AUTOCOMPLETE_PATH_TOKEN_PREFIX) :]
+        return bool(suffix) and all(ch in "0123456789abcdef" for ch in suffix.lower())
+
+    def _prune_autocomplete_path_tokens(self) -> None:
+        now = time.time()
+        for token, (_, _, _, expires_at) in list(
+            self._autocomplete_path_tokens.items()
+        ):
+            if now >= expires_at:
+                self._autocomplete_path_tokens.pop(token, None)
+
+    def _register_project_path_token(
+        self, *, channel_id: str, user_id: str, project_path: str
+    ) -> str:
+        while True:
+            token = f"{_AUTOCOMPLETE_PATH_TOKEN_PREFIX}{secrets.token_hex(6)}"
+            if token not in self._autocomplete_path_tokens:
+                break
+        self._autocomplete_path_tokens[token] = (
+            channel_id,
+            user_id,
+            project_path,
+            time.time() + _AUTOCOMPLETE_PATH_TOKEN_TTL_SECONDS,
+        )
+        self._prune_autocomplete_path_tokens()
+        return token
+
+    def _resolve_autocomplete_project_path(
+        self, *, channel_id: str, user_id: str, value: str
+    ) -> str | None:
+        if not self._is_autocomplete_path_token(value):
+            return value
+        self._prune_autocomplete_path_tokens()
+        record = self._autocomplete_path_tokens.get(value)
+        if record is None:
+            return None
+        token_channel_id, token_user_id, path, expires_at = record
+        if token_channel_id != channel_id or token_user_id != user_id:
+            return None
+        if time.time() >= expires_at:
+            self._autocomplete_path_tokens.pop(value, None)
+            return None
+        return path
+
+    def _has_session_record(self, channel_id: str) -> bool:
+        helper = getattr(self.service, "has_session_record", None)
+        if callable(helper):
+            return bool(helper(channel_id))
+        return self.service.is_active(channel_id)
 
     # ------------------------------------------------------ slash commands
 
@@ -545,6 +750,19 @@ class CodexRcBot(discord.Client):
                         "❌ `project_path` is required for start.", ephemeral=True
                     )
                     return
+                resolved_project_path = bot._resolve_autocomplete_project_path(
+                    channel_id=channel_id,
+                    user_id=str(interaction.user.id),
+                    value=project_path,
+                )
+                if resolved_project_path is None:
+                    await interaction.response.send_message(
+                        "❌ The selected path is no longer available. "
+                        "Please reopen `/codex start` and reselect the path.",
+                        ephemeral=True,
+                    )
+                    return
+                project_path = resolved_project_path
                 permission_preset = permissions.value if permissions else None
                 try:
                     permission_kwargs = _start_permission_kwargs(permission_preset)
@@ -571,12 +789,23 @@ class CodexRcBot(discord.Client):
                     f"🟢 Session started. Project: `{sess.project_path}`"
                 )
             elif kind == "stop":
+                if not bot._has_session_record(channel_id):
+                    await interaction.response.send_message(
+                        "No session in this channel.", ephemeral=True
+                    )
+                    return
                 await interaction.response.defer(thinking=True, ephemeral=False)
                 await bot.service.stop_session(channel_id)
                 await interaction.followup.send("🛑 Session stopped.")
+            elif kind == "restart":
+                view = _build_restart_confirmation_view(bot, channel_id)
+                await interaction.response.send_message(
+                    "♻️ Confirm gateway restart for new code deployment.",
+                    view=view,
+                )
             elif kind == "status":
-                sess = bot.service.store.get(channel_id)
-                if sess is None:
+                status_session = bot.service.store.get(channel_id)
+                if status_session is None:
                     await interaction.response.send_message(
                         "No session in this channel.", ephemeral=True
                     )
@@ -589,11 +818,13 @@ class CodexRcBot(discord.Client):
                     await interaction.response.send_message(
                         status_text
                         or (
-                            f"channel `{sess.channel_id}` · state `{sess.state}` · "
-                            f"project `{sess.project_path}`\n"
-                            f"thread `{sess.codex_thread_id or '—'}` · "
-                            f"handoff `{sess.handoff_id or '—'}` · "
-                            f"sandbox `{sess.sandbox}` · approval `{sess.approval}`"
+                            f"channel `{status_session.channel_id}` · "
+                            f"state `{status_session.state}` · "
+                            f"project `{status_session.project_path}`\n"
+                            f"thread `{status_session.codex_thread_id or '—'}` · "
+                            f"handoff `{status_session.handoff_id or '—'}` · "
+                            f"sandbox `{status_session.sandbox}` · "
+                            f"approval `{status_session.approval}`"
                         )
                     )
             elif kind == "capabilities":
@@ -647,30 +878,9 @@ class CodexRcBot(discord.Client):
                         "No threads recorded for this channel.", ephemeral=True
                     )
                     return
-                import time as _time
-
-                lines: list[str] = []
-                for t in threads:
-                    age_s = _time.time() - t.last_used_at
-                    if age_s < 90:
-                        age = f"{int(age_s)}s ago"
-                    elif age_s < 3600:
-                        age = f"{int(age_s / 60)}m ago"
-                    elif age_s < 86400:
-                        age = f"{int(age_s / 3600)}h ago"
-                    else:
-                        age = f"{int(age_s / 86400)}d ago"
-                    preview = (t.preview or "(no preview)")[:80]
-                    lines.append(
-                        f"`{t.codex_thread_id[:8]}` · **{t.turn_count}** turns · {age}\n  {preview}"
-                    )
-                embed = discord.Embed(
-                    title="🧵 Thread history",
-                    description="\n\n".join(lines),
-                    color=0x3498DB,
+                await interaction.response.send_message(
+                    embed=_build_thread_history_embed(threads)
                 )
-                embed.set_footer(text="Resume now uses handoff ids from /codex stop")
-                await interaction.response.send_message(embed=embed)
             elif kind == "resume":
                 if not project_path:
                     handoffs = bot.service.store.list_handoffs(
@@ -846,6 +1056,19 @@ class CodexRcBot(discord.Client):
                     mention_author=False,
                 )
                 return
+            resolved_project_path = self._resolve_autocomplete_project_path(
+                channel_id=channel_id,
+                user_id=str(message.author.id),
+                value=project_path,
+            )
+            if resolved_project_path is None:
+                await message.reply(
+                    "❌ The selected path is no longer available. "
+                    "Please reopen `/codex start` and reselect the path.",
+                    mention_author=False,
+                )
+                return
+            project_path = resolved_project_path
             try:
                 permission_kwargs = _start_permission_kwargs(permission_preset)
             except ValueError as exc:
@@ -869,8 +1092,21 @@ class CodexRcBot(discord.Client):
                 mention_author=False,
             )
         elif action == "stop":
+            if not self._has_session_record(channel_id):
+                await message.reply(
+                    "No session in this channel.",
+                    mention_author=False,
+                )
+                return
             await self.service.stop_session(channel_id)
             await message.reply("🛑 Session stopped.", mention_author=False)
+        elif action == "restart":
+            view = _build_restart_confirmation_view(self, channel_id)
+            await message.reply(
+                "♻️ Confirm gateway restart for new code deployment.",
+                view=view,
+                mention_author=False,
+            )
         elif action == "history":
             await self._reply_thread_history(message, channel_id)
         elif action == "resume":
@@ -898,11 +1134,17 @@ class CodexRcBot(discord.Client):
             if action == "compact":
                 await self._slash_compact(message, channel_id)
             else:
+                if not self._has_session_record(channel_id):
+                    await message.reply(
+                        "No session in this channel.",
+                        mention_author=False,
+                    )
+                    return
                 await self.service.stop_session(channel_id)
                 await message.reply("🛑 Session stopped.", mention_author=False)
         elif action == "status":
-            sess = self.service.store.get(channel_id)
-            if sess is None:
+            status_session = self.service.store.get(channel_id)
+            if status_session is None:
                 await message.reply(
                     "No session in this channel.", mention_author=False
                 )
@@ -915,11 +1157,13 @@ class CodexRcBot(discord.Client):
                 await message.reply(
                     status_text
                     or (
-                        f"channel `{sess.channel_id}` · state `{sess.state}` · "
-                        f"project `{sess.project_path}`\n"
-                        f"thread `{sess.codex_thread_id or '—'}` · "
-                        f"handoff `{sess.handoff_id or '—'}` · "
-                        f"sandbox `{sess.sandbox}` · approval `{sess.approval}`"
+                        f"channel `{status_session.channel_id}` · "
+                        f"state `{status_session.state}` · "
+                        f"project `{status_session.project_path}`\n"
+                        f"thread `{status_session.codex_thread_id or '—'}` · "
+                        f"handoff `{status_session.handoff_id or '—'}` · "
+                        f"sandbox `{status_session.sandbox}` · "
+                        f"approval `{status_session.approval}`"
                     ),
                     mention_author=False,
                 )
@@ -932,7 +1176,7 @@ class CodexRcBot(discord.Client):
             await message.reply(
                 "❌ Unknown action. Supported:\n"
                 "`/codex start <path>`, `/codex stop`, `/codex status`, "
-                "`/codex capabilities`, "
+                "`/codex restart`, `/codex capabilities`, "
                 "`/codex history`, `/codex resume <handoff-id>`, `/codex new`, "
                 "`/codex cancel`, `/codex rollback [N]`.\n"
                 "Codex slashes: `/model [id]`, `/permissions <preset>`, "
@@ -950,31 +1194,9 @@ class CodexRcBot(discord.Client):
                 "No threads recorded for this channel yet.", mention_author=False
             )
             return
-        import time as _time
-
-        lines: list[str] = []
-        for t in threads:
-            short_id = t.codex_thread_id[:8]
-            age_s = _time.time() - t.last_used_at
-            if age_s < 90:
-                age = f"{int(age_s)}s ago"
-            elif age_s < 3600:
-                age = f"{int(age_s / 60)}m ago"
-            elif age_s < 86400:
-                age = f"{int(age_s / 3600)}h ago"
-            else:
-                age = f"{int(age_s / 86400)}d ago"
-            preview = (t.preview or "(no preview)")[:80]
-            lines.append(
-                f"`{short_id}` · **{t.turn_count}** turns · {age}\n  {preview}"
-            )
-        embed = discord.Embed(
-            title="🧵 Thread history",
-            description="\n\n".join(lines),
-            color=0x3498DB,
+        await message.reply(
+            embed=_build_thread_history_embed(threads), mention_author=False
         )
-        embed.set_footer(text="Resume now uses handoff ids from /codex stop")
-        await message.reply(embed=embed, mention_author=False)
 
     async def _resume_thread(
         self,
@@ -1358,6 +1580,8 @@ class CodexRcBot(discord.Client):
         # callbacks; don't double-fire approval logic on them.
         if custom_id.startswith(RESUME_BUTTON_PREFIX):
             return
+        if custom_id.startswith(GATEWAY_RESTART_BUTTON_PREFIX):
+            return
         channel_id = str(interaction.channel_id)
         if not self.access.allows(str(interaction.user.id), channel_id):
             await interaction.response.send_message(
@@ -1593,7 +1817,9 @@ async def run() -> None:
             channel_id, frames, interval_s=interval_s, loop=loop
         )
 
-    async def on_turn_stage(channel_id: str, stage: str, _params: dict) -> None:
+    async def on_turn_stage(
+        channel_id: str, stage: str, _params: dict[str, Any]
+    ) -> None:
         bot = bot_ref[0]
         if bot is None:
             return
@@ -1668,7 +1894,7 @@ async def run() -> None:
 
         health_host = os.environ.get("CODEX_RC_HEALTH_HOST", "127.0.0.1").strip()
 
-        def health_snapshot() -> dict:
+        def health_snapshot() -> dict[str, object]:
             return {
                 "version": _version,
                 "active_channels": len(service._channels),  # noqa: SLF001

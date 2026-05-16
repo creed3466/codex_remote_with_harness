@@ -70,7 +70,7 @@ def _reserve_free_port(host: str) -> int:
     s = socket.socket()
     try:
         s.bind((host, 0))
-        return s.getsockname()[1]
+        return int(s.getsockname()[1])
     finally:
         s.close()
 

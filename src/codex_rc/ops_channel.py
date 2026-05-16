@@ -11,11 +11,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-PostCallable = Callable[[str, dict], Awaitable[None]]
+PostCallable = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
 class OpsChannelLogHandler(logging.Handler):

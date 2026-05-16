@@ -43,49 +43,18 @@ def test_run_creates_env_with_required_values(
     monkeypatch.chdir(tmp_path)
     _stub_inputs(
         monkeypatch,
-        ["tok-abc", "app-123", "271656041958080518", ""],  # guild blank
+        ["tok-abc", "app-123", "111111111111111111", ""],  # guild blank
     )
     code = setup_wizard.run(cwd=tmp_path, stdout=io.StringIO())
     assert code == 0
     env = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "CODEX_RC_DISCORD_TOKEN=tok-abc" in env
     assert "CODEX_RC_DISCORD_APP_ID=app-123" in env
-    assert "CODEX_RC_ALLOWED_USER_IDS=271656041958080518" in env
+    assert "CODEX_RC_ALLOWED_USER_IDS=111111111111111111" in env
     assert "CODEX_RC_DISCORD_GUILD_ID=\n" in env or "CODEX_RC_DISCORD_GUILD_ID=" in env
     # Preserves comments and unrelated keys.
     assert "# header" in env
     assert "CODEX_RC_DEFAULT_SANDBOX=workspace-write" in env
-
-
-def test_run_guided_prints_invite_and_runs_doctor(
-    tmp_path: Path,
-    example_template: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(setup_wizard, "_codex_login_hint", lambda: "ok")
-    _stub_inputs(monkeypatch, ["tok-abc", "1234567890", "111", ""])
-
-    from codex_rc import gateway
-
-    called: dict[str, object] = {}
-
-    def fake_print_doctor(cwd: Path, *, fix: bool = False) -> int:
-        called["cwd"] = cwd
-        called["fix"] = fix
-        return 0
-
-    monkeypatch.setattr(gateway, "print_doctor", fake_print_doctor)
-    out = io.StringIO()
-
-    code = setup_wizard.run_guided(cwd=tmp_path, stdout=out)
-
-    assert code == 0
-    assert called == {"cwd": tmp_path, "fix": True}
-    text = out.getvalue()
-    assert "codex_rc guided setup" in text
-    assert "discord.com/oauth2/authorize" in text
-    assert "client_id=1234567890" in text
 
 
 def test_run_writes_optional_guild_when_provided(
@@ -135,15 +104,12 @@ def test_run_backs_up_when_overwriting(
     assert "CODEX_RC_DISCORD_TOKEN=new" in (tmp_path / ".env").read_text(encoding="utf-8")
 
 
-def test_run_uses_embedded_template_when_env_example_missing(
+def test_run_errors_when_template_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    # No .env.example anywhere — force the bundled fallback to miss too by
+    # pointing at a clean directory.
     monkeypatch.setattr(setup_wizard, "_find_example", lambda _start: None)
-    _stub_inputs(monkeypatch, ["tok", "app", "uid", ""])
-
     code = setup_wizard.run(cwd=tmp_path, stdout=io.StringIO())
-    assert code == 0
-    env = (tmp_path / ".env").read_text(encoding="utf-8")
-    assert "CODEX_RC_DISCORD_TOKEN=tok" in env
-    assert "CODEX_RC_TRANSPORT=ws" in env
+    assert code == 2

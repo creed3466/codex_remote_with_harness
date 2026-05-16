@@ -199,6 +199,30 @@ def test_parse_stage_3_to_4_files_changed_tolerates_blank_lines() -> None:
     assert [fc.path for fc in handoff.files_changed] == ["src/a.py", "src/b.py"]
 
 
+def test_stage_3_to_4_round_trip_with_empty_optionals() -> None:
+    handoff = Stage3To4Handoff(
+        workflow_id="wf-empty-opt",
+        original_task="t",
+        selected_plan="A",
+        plan_title="P",
+        what_was_implemented="w",
+        files_changed=(FileChange(path="src/x.py", kind="M", summary="x"),),
+        tests_added=(),
+        out_of_scope=(),
+        verification_checklist=("`pytest` — green",),
+        risks=(),
+        output_budget_tokens=1500,
+    )
+
+    md = handoff.to_markdown()
+    assert "- none" in md
+
+    parsed = parse_stage_3_to_4(md)
+    assert parsed.tests_added == ()
+    assert parsed.out_of_scope == ()
+    assert parsed.risks == ()
+
+
 def test_parse_stage_3_to_4_rejects_unknown_file_change_kind() -> None:
     md = """
     # Verification Brief — wf-bad
@@ -541,6 +565,24 @@ def test_parse_final_summary_accepts_empty_caveats() -> None:
     md = summary.to_markdown()
     parsed = parse_final_summary(md)
 
+    assert parsed.caveats == ()
+
+
+def test_parse_final_summary_round_trip_with_empty_optional_sections() -> None:
+    summary = FinalSummary(
+        workflow_id="wf-empty-final",
+        what_was_asked="t",
+        what_was_done="done",
+        verification_results=("✅ pytest — green",),
+        files_changed=(),
+        caveats=(),
+    )
+
+    md = summary.to_markdown()
+    assert "- None" in md
+
+    parsed = parse_final_summary(md)
+    assert parsed.files_changed == ()
     assert parsed.caveats == ()
 
 

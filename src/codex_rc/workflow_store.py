@@ -18,6 +18,7 @@ import shutil
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 _META_FILENAME = "meta.json"
 _ARCHIVE_DIRNAME = "_archive"
@@ -59,7 +60,7 @@ class WorkflowMeta:
     outcome: str | None = None
     last_error: str | None = None
 
-    def to_json_dict(self) -> dict:
+    def to_json_dict(self) -> dict[str, Any]:
         return {
             "workflow_id": self.workflow_id,
             "channel_id": self.channel_id,
@@ -73,7 +74,7 @@ class WorkflowMeta:
         }
 
     @classmethod
-    def from_json_dict(cls, raw: dict) -> WorkflowMeta:
+    def from_json_dict(cls, raw: dict[str, Any]) -> WorkflowMeta:
         return cls(
             workflow_id=str(raw["workflow_id"]),
             channel_id=str(raw["channel_id"]),
