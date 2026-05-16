@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Create venv & install
+        run: |
+          uv venv --python ${{ matrix.python-version }} .venv
+          uv pip install --python .venv/bin/python -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: .venv/bin/ruff check src/codex_rc tests
+
+      - name: Tests + coverage
+        run: |
+          .venv/bin/python -m pytest --cov --cov-report=term --cov-report=xml -q
+
+      - name: Upload coverage XML
+        uses: actions/upload-artifact@v4
+        if: matrix.python-version == '3.12'
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn
+          retention-days: 14

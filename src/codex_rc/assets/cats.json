@@ -1,0 +1,62 @@
+{
+  "$schema": "cats-v3",
+  "description": "Lightweight emoji frame strings. The bot sends frame[0] to a channel and then edits the same message through the remaining frames at a fixed interval, giving a simple animation without any image asset.",
+  "frame_interval_s": 1.0,
+  "cats": [
+    {
+      "name": "happy",
+      "frames": [
+        "🐱 thinking…",
+        "😺 thinking…",
+        "😸 thinking…",
+        "😻 thinking…",
+        "😸 thinking…",
+        "😺 thinking…"
+      ]
+    },
+    {
+      "name": "ponder",
+      "frames": [
+        "🤔 hmm…",
+        "😼 hmm…",
+        "🐱 hmm…",
+        "😹 hmm…",
+        "🐱 hmm…",
+        "😼 hmm…"
+      ]
+    },
+    {
+      "name": "sleepy",
+      "frames": [
+        "😴 zzz…",
+        "😺 zzz…",
+        "💤 zzz…",
+        "😻 zzz…",
+        "💤 zzz…",
+        "😴 zzz…"
+      ]
+    },
+    {
+      "name": "kawaii",
+      "frames": [
+        "✨ working…",
+        "🌟 working…",
+        "💫 working…",
+        "✨ working…",
+        "🐱 working…",
+        "🌟 working…"
+      ]
+    },
+    {
+      "name": "stretch",
+      "frames": [
+        "🐈 stretching…",
+        "🐈‍⬛ stretching…",
+        "😸 stretching…",
+        "🐱 stretching…",
+        "🐈 stretching…",
+        "😺 stretching…"
+      ]
+    }
+  ]
+}
